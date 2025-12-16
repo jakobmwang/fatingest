@@ -1,2 +1,2 @@
-# litepipe
-Standardized document ingestion preparation with minimal configuration.
+# liteparse
+Simple document extraction with minimal configuration.
