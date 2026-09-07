@@ -242,19 +242,39 @@ st, r = deliver(fc, "beta-alone", md2, "b.md")
 check("8.1 a member delivered on its own is already complete -> 200", st == 200 and r["status"] == "ingested")
 st, r = post("/v1/ingest/delete", {"feed": fb, "uri": "same-bundle"})
 check("8.2 delete answers existed=True", st == 200 and r["existed"] is True)
+
+
+def settle(timeout=120):
+    """Until no chunk is pending embedding: the embed worker holds the rows it is embedding
+    (FOR NO KEY UPDATE), and GC skips locked rows by design - they go next run. A GC check
+    must not race it."""
+    t0 = time.time()
+    while call("GET", "/health")[1]["chunks_pending_embed"] and time.time() - t0 < timeout:
+        time.sleep(0.5)
+
+
+def member_chunks():
+    """The chunks of the three members only this archive holds - counted by their own tokens,
+    so neither a leftover of an earlier run nor a chunk a worker holds decides the check."""
+    tokens = [content.decode().split("Token ")[1].split(".")[0].split("\n")[0] for content in (dup2, deep, notes)]
+    return q1("SELECT count(*) FROM chunks WHERE markdown LIKE ANY(%s)", ["%" + t + "%" for t in tokens])
+
+
+settle()
 st, g = call("POST", "/v1/gc", params={"stale_days": 14})
 check("8.3 gc removes nothing while feed a still claims the archive",
-      g["files"] == 0 and g["chunks"] == 0, str(g))
+      g["files"] == 0 and member_chunks() == 3, f"{g} member chunks {member_chunks()}")
 before = q1("SELECT count(*) FROM files")
 post("/v1/ingest/delete", {"feed": fa, "uri": "bundle"})
+settle()
 st, g = call("POST", "/v1/gc", params={"stale_days": 14})
 check("8.4 one gc call removes the archive and its three orphaned members", g["files"] == 4, str(g))
 check("8.5 archive_members rows cascaded away",
       q1("SELECT count(*) FROM archive_members WHERE archive_sha256=%s", zs) == 0)
 check("8.6 members claimed elsewhere survive",
       q1("SELECT count(*) FROM files WHERE sha256 = ANY(%s)", [sha(md1), sha(md2)]) == 2)
-check("8.7 their chunks swept with them", g["chunks"] == 3, str(g))
-if g["chunks"] != 3:                       # which orphan's chunk survived, and who holds it?
+check("8.7 their chunks swept with them", member_chunks() == 0 and g["chunks"] >= 3, f"{g} member chunks {member_chunks()}")
+if member_chunks():                        # which orphan's chunk survived, and who holds it?
     with psycopg.connect(DB) as cd:
         for name, content in (("dup2", dup2), ("deep", deep), ("notes", notes)):
             token = content.decode().split("Token ")[1].split(".")[0].split("\n")[0]

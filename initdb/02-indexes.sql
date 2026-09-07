@@ -3,5 +3,6 @@ CREATE INDEX idx_chunks_embedding ON chunks USING diskann(embedding vector_cosin
 -- BM25 over the NORMALIZED text (see fatingest_norm in 01-schema.sql); every lexical query
 -- goes through the same function. 'simple' = vanilla BM25: no stemming, no stopwords, exact
 -- tokens - identifiers, names and codes survive, and the config is language-neutral.
--- Changing fatingest_norm means REINDEX here and TRUNCATE + rebuild of vocab.
+-- Changing fatingest_norm means REINDEX here and a reconciliation of vocab (the statement in
+-- migrations/2026-09-07-vocab-counts.sql).
 CREATE INDEX idx_chunks_markdown_bm25 ON chunks USING bm25((fatingest_norm(markdown))) WITH (text_config='simple');

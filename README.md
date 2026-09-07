@@ -61,9 +61,12 @@ OpenAI-compatible multimodal embedding endpoint.
   tokenization (`fatingest_norm`: `KMD-1234`, `1.234,56`, `§ 12`, `-500`, `sha256://…`), the
   same function for index and query. Semantic matching is the vector index's job.
 - **Fuzziness lives in the vocabulary, not the corpus.** Every (surface, term) pair the
-  corpus has produced sits in `vocab` with a trigram index; typo tolerance, compound
-  matching and regex run there and translate to exact BM25 terms. The cost follows the
-  vocabulary, which grows sublinearly, not the corpus - there is no trigram index on text.
+  corpus holds sits in `vocab` with a trigram index; typo tolerance, compound matching and
+  regex run there and translate to exact BM25 terms. The cost follows the vocabulary, which
+  grows sublinearly, not the corpus - there is no trigram index on text. The vocabulary is
+  kept exact by the events themselves: a chunk's insertion counts its pairs up, its deletion
+  counts them down, and a pair no chunk holds is gone - it never offers a word the corpus
+  does not contain.
 
 ## Schema (six tables)
 
@@ -73,7 +76,7 @@ files           (sha256 PK, meta, created_at, due_at, started_at, parsed_at, fai
 archive_members (archive_sha256, path PK, member_sha256)    -- what an archive contains; replaced per (re)parse
 files_chunks    (file_sha256, idx PK, chunk_sha256, meta)   -- the file's chunk collection; replaced per (re)parse
 chunks          (sha256 PK, markdown, render_sha256, meta, embedding)   -- meta: status, error, visual, text_chars (derived, never identity)
-vocab           (surface, term PK)                          -- every (surface, index term) pair the corpus has produced
+vocab           (surface, term PK, n_chunks)                -- every (surface, index term) pair the corpus holds, and how many chunks hold it
 ```
 
 A file's progress is a set of milestone dates, each set once when reached and NULL until
@@ -221,7 +224,9 @@ carries) are rewritten to `sha256://<sha>` content addresses by one shared rule;
 that resolves to nothing is left as written. A target never passes through the VLM: on that
 route each anchor is handed over marked as `[anchor](L1)` and the mark is exchanged for the
 real target after generation, because an address is exact or it is worthless and one mutated
-character in a content address destroys it. Already-complete members are never re-parsed, and neither are pages: a generated
+character in a content address destroys it. Two links to one target with nothing but whitespace
+between them - a URL wrapped at the margin, an anchor running onto the next line - are one link
+again, the anchors joined by the whitespace that stood between them. Already-complete members are never re-parsed, and neither are pages: a generated
 chunk's identity (render + `PARSER_VERSION`) is known before the VLM is called, so every
 finished transcription is written to `chunks` at once and looked up first next time. A
 delivery deferred halfway through a long document resumes with the pages it lacks, and a

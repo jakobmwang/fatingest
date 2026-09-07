@@ -479,6 +479,10 @@ check("O.9 a relative reference resolves the same way",
 for md in ("[a](https://example.org/x?y=1)", "[a](mailto:en@example.org)", "[a](mangler.pdf)", "[a](#afsnit)",
            f"[a](sha256://{n_sha})", "ingen links her"):
     check(f"O.10 left as written: {md[:34]}", pdf_engine._rewrite_md_links(md, "doc.pdf", MEM) == md)
+check("O.10b two neighbouring references that resolve to one address are one link, joined by what stood between",
+      pdf_engine._rewrite_md_links("[se](file://bilag/note.txt)\n[noten](bilag/note.txt) og [andet](https://x.dk/)", "doc.pdf", MEM)
+      == f"[se\nnoten](sha256://{n_sha}) og [andet](https://x.dk/)",
+      pdf_engine._rewrite_md_links("[se](file://bilag/note.txt)\n[noten](bilag/note.txt) og [andet](https://x.dk/)", "doc.pdf", MEM))
 prep = app._prepared_from_parser([
     {"markdown": "tekstlag", "render": b"R1", "meta": {"status": "ok", "source": "text_layer"}},
     {"markdown": "transskriberet", "render": b"R2", "meta": {"status": "ok", "source": "vlm"}},
@@ -583,8 +587,18 @@ check("Q.2 anchors sharing a target share a mark",
       sup.strip() == "[alfa](L1) [beta](L2) [gamma](L1)" and lab == {"L1": "https://x.dk/1", "L2": "https://x.dk/2"}, f"{sup!r} {lab}")
 text, sup, lab = _read(_pdf(["læs mere om", "dine muligheder", "og andet"],
                             [("læs mere om", "https://kl.dk/p"), ("dine muligheder", "https://kl.dk/p")]))
-check("Q.3 a link across two lines is two anchors with one mark, and the line break stays outside",
-      sup.count("](L1)") == 2 and "[læs mere om](L1)" in sup and "[dine muligheder](L1)" in sup and lab == {"L1": "https://kl.dk/p"}, f"{sup!r}")
+check("Q.3 a link across two lines is one anchor with one mark, the line break inside it",
+      sup.count("](L1)") == 1 and "[læs mere om\ndine muligheder](L1)" in sup and lab == {"L1": "https://kl.dk/p"}, f"{sup!r}")
+text, sup, lab = _read(_pdf(["alfa beta", "gamma delta"], [("alfa beta", "https://x.dk/1"), ("gamma", "https://x.dk/1"), ("delta", "https://x.dk/2")]))
+check("Q.3b the join stops where the target changes",
+      "[alfa beta\ngamma](L1) [delta](L2)" in sup and lab == {"L1": "https://x.dk/1", "L2": "https://x.dk/2"}, f"{sup!r}")
+J = pdf_engine._join_split_links
+check("Q.3c joining: a space, a line break, nothing between, and a chain of three",
+      J("[a](U) [b](U)") == "[a b](U)" and J("[a](U)\n[b](U)") == "[a\nb](U)" and J("[a](U)[b](U)") == "[ab](U)"
+      and J("[a](U)\n[b](U) [c](U)") == "[a\nb c](U)" and J("x [https://d.org/10.](U)\n[1/x](U), y") == "x [https://d.org/10.\n1/x](U), y")
+check("Q.3d left alone: different targets, a blank line between, text between, escaped brackets kept",
+      J("[a](U) [b](V)") == "[a](U) [b](V)" and J("[a](U)\n\n[b](U)") == "[a](U)\n\n[b](U)"
+      and J("[a](U) og [b](U)") == "[a](U) og [b](U)" and J(r"[\[a\]](U) [b](U)") == r"[\[a\] b](U)")
 text, sup, lab = _read(_pdf(["tekst uden link"], extra=lambda p: p.insert_link(
     {"kind": pymupdf.LINK_URI, "uri": "https://x.dk/tom", "from": pymupdf.Rect(300, 300, 400, 320)})))
 check("Q.4 a link over nothing but empty page produces no anchor and no mark", sup.strip() == "tekst uden link" and lab == {}, f"{sup!r} {lab}")
@@ -605,6 +619,10 @@ pdf_engine.vlm = lambda image, prompt: "[noten](L1)"
 md, meta = pdf_engine.transcribe(b"png", "p", {"L1": f"sha256://{n_sha}"})
 check("Q.8 after generation the mark becomes the target",
       md == f"[noten](sha256://{n_sha})" and meta["status"] == "ok", f"{md!r}")
+pdf_engine.vlm = lambda image, prompt: "se [https://kl.dk/](L1)\n[vejledning](L1) her"
+md, _ = pdf_engine.transcribe(b"png", "p", {"L1": "https://kl.dk/vejledning"})
+check("Q.8b a link the model wrote in two pieces around a line break is one link with the real target",
+      md == "se [https://kl.dk/\nvejledning](https://kl.dk/vejledning) her", f"{md!r}")
 pdf_engine.vlm = lambda image, prompt: "[opfundet](L9) og [ægte](L1)"
 md, _ = pdf_engine.transcribe(b"png", "p", {"L1": "https://x.dk/1"})
 check("Q.9 a mark the model invented is left alone, a real one is exchanged",
@@ -844,6 +862,62 @@ check("V.7 bars a few points apart are one drawing", len(regions[0]) == 1, str([
 regions = pdf_engine.drawn_regions(_pdf_with(lambda pg: pg.draw_rect(pymupdf.Rect(100, 100, 120, 110), fill=(0, 0, 0))))
 im = Image.open(io.BytesIO(regions[0][0][0]))
 check("V.8 a tiny drawing is rendered large: a 20 x 10 pt box fills the render width", im.size[0] >= 1200, str(im.size))
+
+print("--- W. the vocabulary counts the chunks holding each pair and forgets a pair at zero")
+with psycopg.connect(DB, autocommit=True) as cw:
+    tag = f"w{int(time.time() * 1000) % 10**9}"
+    w_shared, w_only1, w_only2, w_swept = f"faelles{tag}", f"ene{tag}", f"anden{tag}", f"fejet{tag}"
+    c1, c2, c3 = (sha(f"w{i} {tag}".encode()) for i in (1, 2, 3))
+
+    def vocab_of(*surfaces):
+        return dict(cw.execute("SELECT surface, n_chunks FROM vocab WHERE surface = ANY(%s)", (list(surfaces),)).fetchall())
+
+    before = cw.execute("SELECT count(*) FROM vocab").fetchone()[0]
+    cw.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, '{}')", (c1, f"{w_shared} {w_only1} {w_shared}"))
+    check("W.1 a new chunk's pairs are counted once each, however often the word occurs in it",
+          vocab_of(w_shared, w_only1) == {w_shared: 1, w_only1: 1}, str(vocab_of(w_shared, w_only1)))
+    cw.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, '{}')", (c2, f"{w_shared} {w_only2}"))
+    check("W.2 a second chunk holding the same word counts it up",
+          vocab_of(w_shared, w_only1, w_only2) == {w_shared: 2, w_only1: 1, w_only2: 1})
+    cw.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, '{}') ON CONFLICT DO NOTHING", (c1, f"{w_shared} {w_only1}"))
+    check("W.3 re-inserting an existing chunk (ON CONFLICT DO NOTHING) counts nothing", vocab_of(w_shared) == {w_shared: 2})
+    cw.execute("DELETE FROM chunks WHERE sha256 = %s", (c1,))
+    check("W.4 deleting a chunk counts its pairs down and forgets the ones only it held",
+          vocab_of(w_shared, w_only1, w_only2) == {w_shared: 1, w_only2: 1}, str(vocab_of(w_shared, w_only1, w_only2)))
+    cw.execute("DELETE FROM chunks WHERE sha256 = %s", (c2,))
+    check("W.5 the last chunk gone, its words are gone: the vocabulary is exactly what it was",
+          vocab_of(w_shared, w_only1, w_only2) == {} and cw.execute("SELECT count(*) FROM vocab").fetchone()[0] == before)
+    cw.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, '{}')", (c3, w_swept))
+    cw.execute("SELECT fatingest_gc(interval '1 day')")
+    check("W.6 GC of an orphan chunk takes its words with it",
+          cw.execute("SELECT count(*) FROM chunks WHERE sha256 = %s", (c3,)).fetchone()[0] == 0 and vocab_of(w_swept) == {})
+    words = [f"{tag}ord{i}" for i in range(30)]
+    errors = []
+
+    def churn(k):
+        try:
+            with psycopg.connect(DB, autocommit=True) as c:
+                for i in range(40):
+                    s = sha(f"churn {tag} {k} {i}".encode())
+                    c.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, '{}')",
+                              (s, " ".join(words[(i + j * (k + 1)) % 30] for j in range(10))))
+                    if i % 2:
+                        c.execute("DELETE FROM chunks WHERE sha256 = %s", (s,))
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+
+    ts = [threading.Thread(target=churn, args=(k,)) for k in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    cw.execute("DELETE FROM chunks WHERE sha256 = ANY(%s)", ([sha(f"churn {tag} {k} {i}".encode()) for k in range(4) for i in range(40)],))
+    check("W.7 four writers inserting and deleting chunks over shared words: no deadlock, and nothing left over",
+          errors == [] and vocab_of(*words) == {}, f"{errors} {vocab_of(*words)}")
+    drift = cw.execute("""SELECT count(*) FROM (
+        (SELECT p.surface, p.term, count(*)::int FROM chunks c, LATERAL vocab_pairs(c.markdown) p GROUP BY 1, 2
+         EXCEPT SELECT surface, term, n_chunks FROM vocab)
+        UNION ALL
+        (SELECT surface, term, n_chunks FROM vocab
+         EXCEPT SELECT p.surface, p.term, count(*)::int FROM chunks c, LATERAL vocab_pairs(c.markdown) p GROUP BY 1, 2)) d""").fetchone()[0]
+    check("W.8 the vocabulary equals the pairs of the chunks that exist, count for count", drift == 0, str(drift))
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

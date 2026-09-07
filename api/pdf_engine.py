@@ -188,6 +188,25 @@ def _resolve_uri(uri: str, member_path: str, members: dict[str, bytes] | None) -
 
 _MD_LINK_RE = re.compile(r"\]\(\s*<?([^)<>\s]+)>?\s*\)")
 _MARK_RE = re.compile(r"\]\((L\d+)\)")
+_SPLIT_LINK_RE = re.compile(
+    r"\[((?:[^\[\]\\]|\\.)*)\]\(([^()\s]+)\)"        # [anchor](target)
+    r"([ \t]*(?:\r?\n[ \t]*)?)"                         # whitespace between, at most one line break
+    r"\[((?:[^\[\]\\]|\\.)*)\]\(\2\)")               # [anchor](the same target)
+
+
+def _join_split_links(md: str) -> str:
+    """Two links to one target with nothing but whitespace between them are one link that a
+    line break cut in two - a URL wrapped at the margin, an anchor running onto the next
+    line. They become one link again, the anchors joined by exactly the whitespace that
+    stood between them, so the reader sees the words as they were. A blank line is a
+    paragraph boundary, not a cut, and is left alone. Every piece of link markdown fatingest
+    produces passes through here - the VLM's support text and its transcription, the text
+    layer's markdown - never markdown a feed delivered."""
+    while True:
+        joined = _SPLIT_LINK_RE.sub(lambda m: f"[{m.group(1)}{m.group(3)}{m.group(4)}]({m.group(2)})", md)
+        if joined == md:
+            return md
+        md = joined
 
 
 def _rewrite_md_links(md: str, member_path: str, members: dict[str, bytes] | None) -> str:
@@ -195,10 +214,11 @@ def _rewrite_md_links(md: str, member_path: str, members: dict[str, bytes] | Non
     another member of the delivery arrives as the relative path it was written with. Each
     target goes through the same rule as everything else, which turns a reference to a
     member into its content address and leaves the rest - web addresses, mail addresses,
-    targets that resolve to nothing - exactly as written."""
+    targets that resolve to nothing - exactly as written. Resolved first, joined after: two
+    neighbouring references that resolve to one address are one link."""
     def one(m):
         return f"]({_resolve_uri(m.group(1), member_path, members) or m.group(1)})"
-    return _MD_LINK_RE.sub(one, md)
+    return _join_split_links(_MD_LINK_RE.sub(one, md))
 
 
 # PDFium is not thread-safe, and both tools sit on it, so the deterministic half of a
@@ -247,10 +267,11 @@ def _read_text(doc, page, member_path: str, members: dict[str, bytes] | None) ->
 
     PDFium hands out the characters in the order it reads them, with its own line breaks,
     and a box for each; a link is a rectangle with a target. A character whose centre lies
-    in a link's rectangle belongs to that link's anchor - so a link across three lines is
-    three anchors carrying the same mark, and no anchor ever has to be matched to a target
-    by anything but its place on the page. Whitespace between two characters of the same
-    anchor belongs to the anchor too; a line break never does.
+    in a link's rectangle belongs to that link's anchor, so no anchor ever has to be matched
+    to a target by anything but its place on the page. Whitespace between two characters of
+    the same anchor belongs to the anchor too. A link across two lines is two rectangles with
+    one target: two anchors with one mark, which _join_split_links makes one anchor again,
+    the line break inside it.
 
     A target never passes through the VLM: an address is exact or it is worthless, and one
     mutated character in a 64-hex content address destroys it. Anchors sharing a target
@@ -322,7 +343,7 @@ def _read_text(doc, page, member_path: str, members: dict[str, bytes] | None) ->
             support.append(anchor)
         i = j
     text = "".join(plain).replace("\r\n", "\n").replace("\r", "\n")
-    marked = "".join(support).replace("\r\n", "\n").replace("\r", "\n")
+    marked = _join_split_links("".join(support).replace("\r\n", "\n").replace("\r", "\n"))
     return text, marked, labels
 
 
@@ -632,7 +653,8 @@ def transcribe(render_png: bytes, prompt: str, labels: dict[str, str] | None = N
     model answered VLM_BLANK_TOKEN, or nothing) or 'unparseable' (a healthy VLM refused this
     request - deterministic under this recipe, so it is a result, not an error). RetryLater
     propagates: the dependency's failure decides nothing. Link marks the model carried
-    through are exchanged for their real targets here; a mark it invented is left alone."""
+    through are exchanged for their real targets here; a mark it invented is left alone; a
+    link the model wrote in two pieces around a line break is one link again."""
     try:
         md = vlm(render_png, prompt)
     except UnparseableError as e:
@@ -641,7 +663,7 @@ def transcribe(render_png: bytes, prompt: str, labels: dict[str, str] | None = N
         return "", {"status": "blank"}
     if labels:
         md = _MARK_RE.sub(lambda m: f"]({labels.get(m.group(1), m.group(1))})", md)
-    return md, {"status": "ok"}
+    return _join_split_links(md), {"status": "ok"}
 
 
 def transcribe_pages(items: list[dict], cache=None, positions: list[int] | None = None) -> list[dict]:

@@ -62,8 +62,10 @@ for t in test_pages test_links_e2e test_main test_search; do
 done
 ```
 
-`test_defer.py` needs an api whose Gotenberg is unreachable: start a second container with
-`-e GOTENBERG_URL=http://127.0.0.1:9 -e GOTENBERG_HEALTH_WAIT=2` and run the suite in it.
+`test_defer.py` needs an api whose Gotenberg is unreachable: stop the container above first
+(its workers would take the suite's deliveries and, finding no spool entry in their own store,
+give them up), then start a second container with `-e GOTENBERG_URL=http://127.0.0.1:9
+-e GOTENBERG_HEALTH_WAIT=2` and run the suite in it.
 
 Every fixture carries a per-run suffix, so the suites can be re-run without cleanup; the
 unit suite removes its own rows. Afterwards: `docker rm -f fatingest-test` and

@@ -22,7 +22,8 @@ END $$;
 -- with the built-in 'simple' configuration (lowercase, no stemming, no stopwords). Every
 -- non-alphanumeric character it meets is a separator, which is why § and the sha256://
 -- scheme have to be rewritten rather than kept. Changing a rule means REINDEX of the BM25
--- index and a rebuild of vocab; chunks themselves are untouched (identities never change).
+-- index and a reconciliation of vocab (the statement in migrations/2026-09-07-vocab-counts.sql);
+-- chunks themselves are untouched (identities never change).
 --
 --   1. sha256://<hex>      -> <hex>                 our own link syntax: the hex stands alone,
 --                                                   so both the bare sha and the full ref match
@@ -187,29 +188,65 @@ CREATE INDEX idx_chunks_unembedded ON chunks(sha256) WHERE embedding IS NULL AND
 -- The diskann and bm25 indexes live in 02-indexes.sql. There is deliberately no trigram
 -- index on the corpus: fuzzy matching and regex run against the vocabulary below.
 
--- The vocabulary: every (surface, term) pair the corpus has produced. Fuzzy matching and
--- regex run here, against what readers see (surface), and translate to index terms - so
--- their cost follows the vocabulary (sublinear in the corpus), not the corpus. It only
--- grows: a term no chunk holds any more simply yields no BM25 hit.
+-- The vocabulary: every (surface, term) pair the corpus holds right now, and how many
+-- chunks hold it. Fuzzy matching and regex run here, against what readers see (surface),
+-- and translate to index terms - so their cost follows the vocabulary (sublinear in the
+-- corpus), not the corpus. The events keep it exact, the way renders are kept: a chunk's
+-- insertion counts its pairs up, its deletion (GC) counts them down, and a pair no chunk
+-- holds is gone - the vocabulary never offers a word the corpus does not contain.
 CREATE TABLE vocab (
     surface  TEXT NOT NULL,
     term     TEXT NOT NULL,
+    n_chunks INTEGER NOT NULL,                          -- chunks holding this pair; a row at zero does not exist
     PRIMARY KEY (surface, term)
 );
 CREATE INDEX idx_vocab_surface_trgm ON vocab USING gist(surface gist_trgm_ops);
 
--- Inserted in a fixed order so that concurrent parse workers acquire the unique-index
--- waits in the same sequence and can never deadlock on the vocabulary.
+-- The pairs one chunk contributes: each once, within the lengths the vocabulary keeps. Both
+-- triggers and the reconciliation in migrations/ count through this one function, so up and
+-- down are mirror images.
+CREATE FUNCTION vocab_pairs(t TEXT) RETURNS TABLE(surface TEXT, term TEXT)
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT DISTINCT v.surface, v.term FROM public.fatingest_vocab(t) v
+     WHERE length(v.surface) <= 120 AND length(v.term) <= 80
+$$;
+
+-- Rows are locked in one fixed order, (surface, term), on both the counting-up and the
+-- counting-down side, so concurrent parse workers and the GC can never deadlock on the
+-- vocabulary.
 CREATE FUNCTION vocab_collect() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    INSERT INTO public.vocab(surface, term)                 -- qualified: restores run with search_path ''
-    SELECT DISTINCT v.surface, v.term FROM public.fatingest_vocab(NEW.markdown) v
-     WHERE length(v.surface) <= 120 AND length(v.term) <= 80
+    INSERT INTO public.vocab(surface, term, n_chunks)      -- qualified: restores run with search_path ''
+    SELECT p.surface, p.term, 1 FROM public.vocab_pairs(NEW.markdown) p
      ORDER BY 1, 2
-    ON CONFLICT DO NOTHING;
+    ON CONFLICT (surface, term) DO UPDATE SET n_chunks = vocab.n_chunks + 1;
     RETURN NULL;
 END $$;
 CREATE TRIGGER chunks_vocab AFTER INSERT ON chunks FOR EACH ROW EXECUTE FUNCTION vocab_collect();
+
+-- Once per DELETE statement, over everything it removed (GC deletes chunks in one batch):
+-- each pair is counted down by the number of gone chunks that held it, and a row at zero
+-- goes. The rows are locked in order (MATERIALIZED: the ordered locking happens as such, not
+-- folded into the update's join) and updated afterwards; the delete only ever meets rows this
+-- statement has just zeroed, since no other transaction leaves a row at zero behind.
+CREATE FUNCTION vocab_release() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    WITH held AS (
+        SELECT p.surface, p.term, count(*) AS n
+          FROM gone g, LATERAL public.vocab_pairs(g.markdown) p
+         GROUP BY 1, 2
+    ), locked AS MATERIALIZED (
+        SELECT v.surface, v.term, h.n
+          FROM public.vocab v JOIN held h ON h.surface = v.surface AND h.term = v.term
+         ORDER BY 1, 2 FOR UPDATE OF v
+    )
+    UPDATE public.vocab v SET n_chunks = v.n_chunks - l.n
+      FROM locked l WHERE v.surface = l.surface AND v.term = l.term;
+    DELETE FROM public.vocab WHERE n_chunks <= 0;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER chunks_vocab_release AFTER DELETE ON chunks REFERENCING OLD TABLE AS gone
+    FOR EACH STATEMENT EXECUTE FUNCTION vocab_release();
 
 -- Relationship rows: a file's current chunk collection, replaced as a set whenever the
 -- file is (re)parsed or (re)delivered.
