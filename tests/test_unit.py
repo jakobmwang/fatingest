@@ -9,6 +9,7 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 
 os.environ["FATINGEST_WORKERS"] = "0"
@@ -276,7 +277,7 @@ c6.close()
 
 print("--- K. the gate: one Gotenberg conversion at a time across connections")
 ca, cb = psycopg.connect(DB), psycopg.connect(DB)
-with app._gate(ca.cursor(), "gotenberg"):
+with app._gate("gotenberg"):
     check("K.1 a second worker cannot take the gate while it is held",
           cb.execute("SELECT pg_try_advisory_lock(hashtext('gotenberg'))").fetchone()[0] is False)
 check("K.2 released after the call", cb.execute("SELECT pg_try_advisory_lock(hashtext('gotenberg'))").fetchone()[0] is True)
@@ -315,6 +316,13 @@ with psycopg.connect(DB) as c:                        # leave nothing behind
 
 failed = [n for n, ok in results if not ok]
 print("--- M. transcribe_pages: verdict per page, blank token, concurrency, memo")
+from concurrent.futures import ThreadPoolExecutor as _TPE   # noqa: E402
+
+
+def _pool(n):
+    """Size the process-wide VLM pool for a check."""
+    pdf_engine._VLM_POOL = _TPE(max_workers=n, thread_name_prefix="vlm-test")
+
 
 
 def png(color, size=(32, 32)):
@@ -339,7 +347,7 @@ def fake_vlm(image, prompt):
 
 
 pdf_engine.vlm = fake_vlm
-out = pdf_engine.transcribe_pages(items, None, 4)
+_pool(4); out = pdf_engine.transcribe_pages(items, None)
 check("M.1 order kept, verdict per page", [o["meta"]["status"] for o in out] == ["ok", "unparseable", "ok", "blank", "ok"],
       str([o["meta"] for o in out]))
 check("M.2 the refused page: empty text, the refusal, render kept",
@@ -348,24 +356,24 @@ check("M.3 the blank page: empty text, status blank", out[3]["markdown"] == ""
       and out[3]["meta"] == {"status": "blank", "visual": 0.5, "text_chars": 10, "source": "vlm"}, str(out[3]["meta"]))
 check("M.4 page hints merged into meta, and the VLM is named as the source",
       out[0]["meta"] == {"status": "ok", "visual": 0.5, "text_chars": 10, "source": "vlm"} and out[0]["markdown"] == "text 0", str(out[0]["meta"]))
-out_e = pdf_engine.transcribe_pages([{"error": "cannot render page: X"}, items[0]], None, 2)
+_pool(2); out_e = pdf_engine.transcribe_pages([{"error": "cannot render page: X"}, items[0]], None)
 check("M.5 an unrenderable page is a verdict in place: no render, status unparseable",
       out_e[0] == {"markdown": "", "render": None, "meta": {"status": "unparseable", "error": "cannot render page: X"}}
       and out_e[1]["markdown"] == "text 0")
 calls.clear()
-pdf_engine.transcribe_pages([items[0], items[2], items[0]], None, 4)
+_pool(4); pdf_engine.transcribe_pages([items[0], items[2], items[0]], None)
 check("M.6 identical renders are transcribed once", len(calls) == 2, str(len(calls)))
 pdf_engine.vlm = lambda image, prompt: (time.sleep(0.3), "slow")[1]
 eight = [{"render": png((i, i, i)), "prompt": "p"} for i in range(8)]
 t0 = time.time()
-pdf_engine.transcribe_pages(eight, None, 8)
+_pool(8); pdf_engine.transcribe_pages(eight, None)
 par = time.time() - t0
 t0 = time.time()
-pdf_engine.transcribe_pages(eight[:3], None, 1)
+_pool(1); pdf_engine.transcribe_pages(eight[:3], None)
 seq = time.time() - t0
 check("M.7 concurrency: 8 pages at 8 in flight take one round, 3 pages at 1 take three", par < 1.0 and seq >= 0.85, f"par {par:.2f}s seq {seq:.2f}s")
 pdf_engine.vlm = lambda image, prompt: (time.sleep(0.3), "empty")[1] if False else ""
-check("M.8 an empty answer is blank too", pdf_engine.transcribe_pages([items[0]], None, 1)[0]["meta"]["status"] == "blank")
+_pool(1); check("M.8 an empty answer is blank too", pdf_engine.transcribe_pages([items[0]], None)[0]["meta"]["status"] == "blank")
 
 
 class FakeCache:
@@ -395,7 +403,7 @@ def flaky(image, prompt):
 pdf_engine.vlm = flaky
 cache = FakeCache()
 try:
-    pdf_engine.transcribe_pages(six, cache, 8)
+    _pool(8); pdf_engine.transcribe_pages(six, cache)
     raised = None
 except pdf_engine.RetryLater as e:
     raised = e
@@ -403,7 +411,7 @@ check("M.9 a RetryLater from one page propagates", raised is not None)
 check("M.10 ... after the pages in flight completed into the memo", len(cache.store) == 5, str(len(cache.store)))
 calls.clear()
 pdf_engine.vlm = lambda image, prompt: (calls.append(image), "recovered")[1]
-out = pdf_engine.transcribe_pages(six, cache, 8)
+_pool(8); out = pdf_engine.transcribe_pages(six, cache)
 check("M.11 the retry transcribes only the missing page", len(calls) == 1 and calls[0] == bad, str(len(calls)))
 check("M.12 memoized pages come back with their stored text and verdict",
       [o["markdown"] for o in out] == ["ok text", "ok text", "recovered", "ok text", "ok text", "ok text"]
@@ -414,7 +422,7 @@ print("--- N. ChunkCache: a looked-up chunk is safe from GC until the collection
 r_n = png((7, 77, 177))
 cn = psycopg.connect(DB)
 cur_n = cn.cursor()
-cc = app.ChunkCache(cur_n)
+cc = app.ChunkCache(cn)
 cc.put(r_n, "memo text", {"status": "ok", "visual": 0.1, "text_chars": 9})
 cid_n = app.chunk_id(None, sha(r_n), True)
 check("N.1 put writes the chunk row at once (own connection) and the render to disk",
@@ -427,18 +435,25 @@ cn.rollback()
 gc2 = fetch("SELECT fatingest_gc(interval '0')")[0]
 check("N.4 released, the orphan is swept", fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 0, str(gc2))
 check("N.5 get on a missing chunk is None", cc.get(r_n) is None)
+cc.put(r_n, "memo text", {"status": "ok"})
+_got = []
+_t = threading.Thread(target=lambda: _got.append(cc.get(r_n))); _t.start(); _t.join()
+check("N.6 a member thread looks up on the worker's connection, and the lock lands in the worker's transaction",
+      _got and _got[0][0] == "memo text" and fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 1
+      and (fetch("SELECT fatingest_gc(interval '0')"), fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0])[1] == 1)
+cn.rollback(); fetch("SELECT fatingest_gc(interval '0')")
 cn.close()
 
 print("--- O. the text-layer route: guard, link rewriting, identity")
 check("O.1 an already resolved item passes through untouched and asks no one",
       pdf_engine.transcribe_pages([{"render": b"x", "markdown": "# fra tekstlaget",
-                                    "meta": {"status": "ok", "source": "text_layer", "visual": 0.0}}], None, 4)
+                                    "meta": {"status": "ok", "source": "text_layer", "visual": 0.0}}], None)
       == [{"markdown": "# fra tekstlaget", "render": b"x",
            "meta": {"status": "ok", "source": "text_layer", "visual": 0.0}}])
 calls.clear()
 pdf_engine.vlm = fake_vlm
 mixed = pdf_engine.transcribe_pages([{"render": renders[0], "prompt": "p"},
-                                     {"render": b"y", "markdown": "tekstlag", "meta": {"status": "ok", "source": "text_layer"}}], None, 4)
+                                     {"render": b"y", "markdown": "tekstlag", "meta": {"status": "ok", "source": "text_layer"}}], None)
 check("O.2 a mixed document: only the VLM item is sent", len(calls) == 1 and calls[0] == renders[0]
       and mixed[1]["markdown"] == "tekstlag" and mixed[0]["meta"]["source"] == "vlm", str(len(calls)))
 pdf_engine.vlm = real_vlm
@@ -670,6 +685,90 @@ check("S.6 a prompt without the blank placeholder is refused at load, naming the
 with _tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
     f.write("Min egen prompt. Svar {blank} hvis tom.\n{support}"); own = f.name
 check("S.7 an operator's own prompt with both placeholders loads", pdf_engine._load_prompt(own).startswith("Min egen prompt"))
+
+print("--- T. an archive's members are parsed in parallel on the file slots")
+import zipfile as _zipfile                                             # noqa: E402
+_real_parse_file = app.parse_file
+_act = {"now": 0, "peak": 0}; _alock = threading.Lock()
+
+
+def _fake_parse(path, data, members, gate, cache):
+    with _alock:
+        _act["now"] += 1; _act["peak"] = max(_act["peak"], _act["now"])
+    try:
+        time.sleep(0.4)
+        if data.startswith(b"DEFER"):
+            raise pdf_engine.RetryLater("vlm unreachable: test")
+        if data.startswith(b"BOOM"):
+            raise ValueError("boom in member")
+        return [{"markdown": f"# {path}", "render": None, "meta": {"status": "ok"}}], {"kind": "text", "content_type": "text/markdown"}
+    finally:
+        with _alock:
+            _act["now"] -= 1
+
+
+def _zip(members):
+    b = io.BytesIO()
+    with _zipfile.ZipFile(b, "w") as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+    return b.getvalue()
+
+
+def _deliver_and_parse(zbytes, tag):
+    """Spool + enqueue a zip and run process_file on a worker-like connection; returns (ok, seconds, conn)."""
+    z_sha = sha(zbytes); app.spool_write(z_sha, zbytes)
+    ct = psycopg.connect(DB); cur_t = ct.cursor()
+    app.enqueue(cur_t, z_sha, {"source": "file", "filename": f"{tag}.zip"}); ct.commit()
+    _act["peak"] = 0; t0 = time.time()
+    try:
+        ok = app.process_file(cur_t, z_sha, {"source": "file", "filename": f"{tag}.zip"}); ct.commit()
+    except Exception as e:
+        ct.rollback(); ok = e
+    return ok, time.time() - t0, ct, z_sha
+
+
+app.parse_file = _fake_parse
+RUN_T = str(int(time.time() * 1000))
+six = {f"m{i}.txt": f"member {i} {RUN_T}".encode() for i in range(6)}
+ok, dt, ct, z1 = _deliver_and_parse(_zip(six), f"t1-{RUN_T}")
+n_members = fetch("SELECT count(*) FROM archive_members WHERE archive_sha256 = %s", z1)[0]
+n_parsed = fetch("SELECT count(*) FROM files f JOIN archive_members am ON am.member_sha256 = f.sha256 WHERE am.archive_sha256 = %s AND f.parsed_at IS NOT NULL AND f.meta->>'kind' = 'text'", z1)[0]
+check("T.1 six members finish in about one round, not six", ok is True and dt < 1.2, f"ok={ok} {dt:.2f}s")
+check("T.2 they ran side by side, and all six are committed with the archive", _act["peak"] >= 4 and n_members == 6 and n_parsed == 6, f"peak={_act['peak']} members={n_members} parsed={n_parsed}")
+ct.close()
+app._FILE_SLOTS = threading.Semaphore(2)
+ok, dt, ct, z2 = _deliver_and_parse(_zip({f"n{i}.txt": f"narrow {i} {RUN_T}".encode() for i in range(6)}), f"t2-{RUN_T}")
+check("T.3 with two file slots, never more than two members run at once (three rounds)", ok is True and _act["peak"] == 2 and 1.1 < dt < 2.0, f"peak={_act['peak']} {dt:.2f}s")
+ct.close()
+app._FILE_SLOTS = threading.Semaphore(app.FILE_CONCURRENCY)
+ok, dt, ct, z3 = _deliver_and_parse(_zip({"a.txt": f"good a {RUN_T}".encode(), "b.txt": f"DEFER {RUN_T}".encode(), "c.txt": f"good c {RUN_T}".encode()}), f"t3-{RUN_T}")
+row = fetch("SELECT parsed_at IS NULL, due_at > now(), meta->>'attempts', meta->>'error' FROM files WHERE sha256 = %s", z3)
+good = fetch("SELECT count(*) FROM files WHERE sha256 = ANY(%s) AND parsed_at IS NOT NULL", [sha(f"good a {RUN_T}".encode()), sha(f"good c {RUN_T}".encode())])[0]
+check("T.4 one member's dependency failure defers the delivery with backoff, nothing new is started",
+      ok is False and row[0] and row[1] and row[2] == "1" and "vlm unreachable" in (row[3] or ""), str(row))
+check("T.5 the members that finished are committed all the same, and the archive is not", good == 2
+      and fetch("SELECT count(*) FROM archive_members WHERE archive_sha256 = %s", z3)[0] == 0, f"good={good}")
+ct.close()
+ok, dt, ct, z4 = _deliver_and_parse(_zip({"x.txt": f"good x {RUN_T}".encode(), "y.txt": f"BOOM {RUN_T}".encode()}), f"t4-{RUN_T}")
+check("T.6 an unexpected error in a member surfaces to the worker after the others finished (deferred as internal there)",
+      isinstance(ok, ValueError) and "boom" in str(ok), str(ok))
+ct.close()
+app.parse_file = _real_parse_file
+with psycopg.connect(DB) as c:
+    c.execute("DELETE FROM files WHERE sha256 = ANY(%s)", ([z1, z2, z3, z4],))
+    c.execute("DELETE FROM files f WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.sha256 = f.sha256) AND NOT EXISTS (SELECT 1 FROM archive_members am WHERE am.member_sha256 = f.sha256) AND f.meta->>'kind' = 'text' AND f.sha256 IN (SELECT sha256 FROM files WHERE created_at > now() - interval '5 minutes')")
+    c.execute("DELETE FROM chunks c WHERE NOT EXISTS (SELECT 1 FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256)")
+for z in (z1, z2, z3, z4):
+    app.spool_delete(z)
+
+print("--- U. search: a chunk no collection holds never ranks")
+with psycopg.connect(DB) as cu:
+    orphan = sha(f"orphan {time.time()}".encode())
+    cu.execute("INSERT INTO chunks(sha256, markdown, meta) VALUES (%s, %s, %s)", (orphan, "memoized page, delivery still parsing", json.dumps({"status": "ok"})))
+    kept = app._keep(cu.cursor(), [orphan], {"lexical": "memoized"}, None, None)
+    check("U.1 _keep drops a chunk without a files_chunks row, so search never has to describe it", kept == {}, str(kept))
+    cu.execute("DELETE FROM chunks WHERE sha256 = %s", (orphan,))
 
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))

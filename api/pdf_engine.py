@@ -25,9 +25,10 @@ on it becomes one with meta.status "blank". Positions are therefore always page 
 Only a document that cannot be opened at all is unparseable as a whole (UnparseableError
 from extract_pages).
 
-Transcription runs VLM_CONCURRENCY pages at a time and, given a cache, remembers every
-finished page under its chunk identity before moving on - so a delivery deferred halfway
-through (RetryLater) resumes with the pages it lacks, not from the start.
+Transcription goes through one pool for the whole process, VLM_CONCURRENCY pages in flight
+whatever file or delivery they belong to, and, given a cache, remembers every finished page
+under its chunk identity before moving on - so a delivery deferred halfway through
+(RetryLater) resumes with the pages it lacks, not from the start.
 
 Links reach a chunk by two paths and mean the same thing on both: a reference to another
 member of the delivery becomes its content address (sha256://<sha>), everything else stays
@@ -50,7 +51,7 @@ import json
 import os
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import httpx
 import liteparse
@@ -117,9 +118,14 @@ def _visual_threshold() -> float:
 VLM_URL = os.environ.get("VLM_URL", "").rstrip("/")
 VLM_MODEL = os.environ.get("VLM_MODEL", "")
 VLM_API_KEY = os.environ.get("VLM_API_KEY", "")   # optional; set when routing through a gateway
-VLM_CONCURRENCY = max(1, int(os.environ.get("VLM_CONCURRENCY", "8")))   # pages in flight per worker
+VLM_CONCURRENCY = max(1, int(os.environ.get("VLM_CONCURRENCY", "8")))   # pages in flight, process-wide
 VLM_BLANK_TOKEN = os.environ.get("VLM_BLANK_TOKEN", "<blank>").strip() or "<blank>"
 VLM_VISUAL_THRESHOLD = _visual_threshold()
+
+# One pool for every VLM call this process makes, whichever delivery or file a page belongs
+# to: VLM_CONCURRENCY is then exactly the load the process puts on the model, and a delivery
+# of many small files fills the pool as well as one large file does.
+_VLM_POOL = ThreadPoolExecutor(max_workers=VLM_CONCURRENCY, thread_name_prefix="vlm")
 
 # One prompt for every image the VLM sees - a document page with its text layer as support,
 # or a picture with none. It lives in a file so an operator can replace it (VLM_PROMPT_FILE)
@@ -561,17 +567,17 @@ def transcribe(render_png: bytes, prompt: str, labels: dict[str, str] | None = N
     return md, {"status": "ok"}
 
 
-def transcribe_pages(items: list[dict], cache=None, concurrency: int | None = None) -> list[dict]:
+def transcribe_pages(items: list[dict], cache=None) -> list[dict]:
     """Generative half for a list of renders, in order: [{markdown, render, meta}].
     An item is {render, prompt, labels?, meta?} for the VLM, {render, markdown, meta} when
     already resolved (text layer, blank by geometry), or {error} (an unrenderable page).
 
     `cache` remembers transcriptions under their chunk identity: get(render) -> (markdown,
-    meta) | None and put(render, markdown, meta). Lookups happen first, one by one on the
-    caller's connection; misses are transcribed up to `concurrency` at a time (identical
-    renders once) and stored the moment they finish. A RetryLater from any page lets the
-    pages in flight complete into the cache, drops the rest and propagates - the retry
-    then transcribes only what is still missing."""
+    meta) | None and put(render, markdown, meta). Lookups happen first, one by one; misses
+    go into the process-wide pool (identical renders once) and are stored the moment they
+    finish. A RetryLater from any page lets this call's pages in flight complete into the
+    cache, withdraws the ones not started and propagates - the retry then transcribes only
+    what is still missing. The pool itself serves everyone else meanwhile."""
     out: list[dict | None] = [None] * len(items)
     todo: dict[str, list[int]] = {}
     for i, it in enumerate(items):
@@ -595,14 +601,17 @@ def transcribe_pages(items: list[dict], cache=None, concurrency: int | None = No
             cache.put(it["render"], md, meta)
         return idxs, md, meta
 
-    ex = ThreadPoolExecutor(max_workers=concurrency or VLM_CONCURRENCY)
+    futures = [_VLM_POOL.submit(one, idxs) for idxs in todo.values()]
     try:
-        for fut in as_completed([ex.submit(one, idxs) for idxs in todo.values()]):
+        for fut in as_completed(futures):
             idxs, md, meta = fut.result()          # RetryLater surfaces here
             for i in idxs:
                 out[i] = {"markdown": md, "render": items[i]["render"], "meta": meta}
-    finally:
-        ex.shutdown(wait=True, cancel_futures=True)  # in flight: finish (and reach the cache); queued: dropped
+    except BaseException:
+        for fut in futures:
+            fut.cancel()                           # not started: withdrawn
+        wait(futures)                              # in flight: finish, and reach the cache
+        raise
     return out  # type: ignore[return-value]
 
 

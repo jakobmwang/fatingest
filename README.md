@@ -173,7 +173,7 @@ store needs neither backup nor replication; missing embeddings heal internally a
 checked). Re-delivering a deferred delivery pulls its retry forward to now. Content already known under another claim still needs one delivery per new
 `(feed, uri)`; it is not re-parsed, so the cost is the upload alone.
 
-**File** deliveries are spooled and queued; `PARSE_WORKERS` identical worker threads take
+**File** deliveries are spooled and queued; `FILE_CONCURRENCY` identical worker threads take
 them in due order (arrival order for fresh deliveries). The queue is `files.parsed_at IS NULL
 AND due_at <= now()` and the row lock is the
 claim (`FOR NO KEY UPDATE SKIP LOCKED`, held for the duration of the parse): no dispatcher,
@@ -184,8 +184,10 @@ in `archive_members`; the archive's own sha is what the feed claims and pings, a
 complete when its members are); PDFs go through
 the page engine, one chunk per page: a page with nothing drawn on it is read from its own
 text layer, and a page with any image or vector graphics is rendered and transcribed by the
-VLM with that text layer as spelling support (`VLM_CONCURRENCY` pages in flight per
-worker); office documents convert via LibreOffice and html via Chromium into the same engine; images become (normalized PNG +
+VLM with that text layer as spelling support. Transcription goes through one pool for the
+whole process, `VLM_CONCURRENCY` pages in flight whatever file they belong to, and an
+archive's members are parsed in parallel on the `FILE_CONCURRENCY` file slots, so a delivery
+of many small files keeps the model as busy as one large file does. Office documents convert via LibreOffice and html via Chromium into the same engine; images become (normalized PNG +
 VLM description) chunks; spreadsheets and tabular data become GFM pipe-table chunks batched
 by row with the header repeated; markdown and text split at ~4000 characters on heading,
 paragraph, line, sentence, word boundaries. Local references (embedding and navigation, in html, markdown and the links a text layer
@@ -280,9 +282,11 @@ mounting your own file and pointing `VLM_PROMPT_FILE` at it. It must carry the p
 `{support}` and `{blank}`; the latter is filled from `VLM_BLANK_TOKEN`, the answer the VLM
 is instructed to give for a page or image with nothing on it (default `<blank>`; any string
 the model reproduces verbatim works), so the instruction and the check can never
-disagree. `VLM_CONCURRENCY` (default 8) is the number of pages each parse worker transcribes
-in parallel - a batching VLM server serves them at almost no extra cost per request, so
-raise it until the GPU is saturated; it is tuning, not recipe.
+disagree. `VLM_CONCURRENCY` (default 8) is the number of pages in flight against the VLM from
+the whole process, and `FILE_CONCURRENCY` (default 8) the number of files being parsed at
+once, archive members counted one by one - the first is the load on the model (mind its
+other users), the second bounds memory (a file's renders live in RAM until its commit). Both
+are tuning, not recipe.
 
 The queues live in the database and workers coordinate through row locks, so additional
 replicas may run workers too.
@@ -295,5 +299,8 @@ separate test image (`tests/Dockerfile`) and never in the product image.
 
 ## Not built yet
 
-- A read endpoint for fetching a file's chunks, renders and meta by sha; search
-  pagination and context expansion (neighbouring chunks of a hit).
+- Read endpoints for fetching a chunk, a file's chunks, renders and meta by sha, and an
+  item by feed and uri; search pagination and context expansion (neighbouring chunks of a
+  hit); the shape of the search answer itself (how much text per hit) is still being decided.
+- Spreadsheets are read cell by cell (exact values, deterministic); charts, images and
+  drawings embedded in a spreadsheet are not seen.

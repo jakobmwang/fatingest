@@ -42,11 +42,16 @@ memoized in the chunks table as they finish (ChunkCache): a delivery deferred ha
 through a long document resumes with the pages it lacks, and a page seen in another
 delivery under the same recipe is never transcribed twice.
 
-Background threads: PARSE_WORKERS identical parse workers each take the oldest due, unlocked
-row of the queue `files.parsed_at IS NULL AND due_at <= now()` (SKIP LOCKED: the row lock is
-the claim, so there is no dispatcher and no in-process bookkeeping; due_at carries the retry
-backoff); the embed worker turns chunks without an embedding into (delivered render |
-synthetic markdown render) + markdown -> embedding.
+Background threads: FILE_CONCURRENCY identical parse workers each take the oldest due,
+unlocked row of the queue `files.parsed_at IS NULL AND due_at <= now()` (SKIP LOCKED: the row
+lock is the claim, so there is no dispatcher and no in-process bookkeeping; due_at carries
+the retry backoff). Two limits shape the load, both process-wide: FILE_CONCURRENCY files
+being parsed at once (an archive's members count one by one - this is what bounds memory,
+since a file's renders live in RAM until its commit), and VLM_CONCURRENCY pages in flight
+against the VLM (pdf_engine's one pool). A worker holding an archive parses its members in
+parallel on whatever file slots are free, so a delivery of many small files fills the VLM
+pool as well as one large file does. The embed worker turns chunks without an embedding
+into (delivered render | synthetic markdown render) + markdown -> embedding.
 """
 import base64
 import binascii
@@ -55,6 +60,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
@@ -68,7 +74,8 @@ from unpack import to_members
 
 DB = os.environ["DATABASE_URL"]
 PACK_VERSION = 1  # canonical file format for chunks deliveries
-PARSE_WORKERS = max(1, int(os.environ.get("PARSE_WORKERS", "2")))
+FILE_CONCURRENCY = max(1, int(os.environ.get("FILE_CONCURRENCY", "8")))   # files being parsed at once, process-wide
+_FILE_SLOTS = threading.Semaphore(FILE_CONCURRENCY)                        # one permit per file in progress
 RETRY_BASE = 60     # seconds; a deferred delivery waits RETRY_BASE * 2**(attempts-1) ...
 RETRY_CAP = 3600    # ... capped here. Dependency failures are retried indefinitely.
 
@@ -88,20 +95,23 @@ class Unrecoverable(Exception):
 class ChunkCache:
     """The transcription memo of pdf_engine.transcribe_pages, keyed by chunk identity
     (render sha + PARSER_VERSION, see chunk_id). get() runs on the parse worker's own
-    cursor with FOR KEY SHARE: GC deletes chunks with FOR UPDATE SKIP LOCKED, so a row the
-    worker is about to reference (and its render on disk) is left alone until the
-    collection is committed. put() runs on a connection of its own, autocommitted, so a
-    finished page survives a deferred delivery; such a row is an orphan until commit_file
+    connection, inside its transaction, with FOR KEY SHARE: GC deletes chunks with FOR
+    UPDATE SKIP LOCKED, so a row the worker is about to reference (and its render on disk)
+    is left alone until the collection is committed. Member threads share that connection
+    (psycopg connections are thread-safe; each call takes its own cursor), so their lookups
+    lock in the same transaction. put() runs on a connection of its own, autocommitted, so
+    a finished page survives a deferred delivery; such a row is an orphan until commit_file
     references it and GC may sweep it meanwhile - which only costs that transcription once
     more, because commit_file re-inserts every chunk from memory."""
 
-    def __init__(self, cur):
-        self.cur = cur
+    def __init__(self, conn):
+        self.conn = conn
 
     def get(self, render: bytes) -> tuple[str, dict] | None:
-        self.cur.execute("SELECT markdown, meta FROM chunks WHERE sha256 = %s FOR KEY SHARE",
-                         (chunk_id(None, sha(render), True),))
-        row = self.cur.fetchone()
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT markdown, meta FROM chunks WHERE sha256 = %s FOR KEY SHARE",
+                        (chunk_id(None, sha(render), True),))
+            row = cur.fetchone()
         return (row[0], row[1]) if row else None
 
     def put(self, render: bytes, markdown: str, meta: dict):
@@ -140,9 +150,11 @@ def commit_file(cur, file_sha: str, meta: dict, chunks: list[dict] | None) -> in
     that already exists is left untouched (immutable), one that GC swept meanwhile comes
     back - so the collection is always complete or the whole file fails. The collection is
     replaced as a set."""
-    cur.execute("""INSERT INTO files(sha256, meta, parsed_at) VALUES (%s, %s, now())
+    # clock_timestamp(), not now(): a delivery is one transaction, and now() is its start -
+    # parsed_at should say when the parse finished, not when the worker took the row.
+    cur.execute("""INSERT INTO files(sha256, meta, parsed_at) VALUES (%s, %s, clock_timestamp())
                    ON CONFLICT (sha256) DO UPDATE
-                   SET meta = EXCLUDED.meta, parsed_at = now(), indexed_at = NULL""",
+                   SET meta = EXCLUDED.meta, parsed_at = clock_timestamp(), indexed_at = NULL""",
                 (file_sha, json.dumps(meta)))
     cur.execute("DELETE FROM files_chunks WHERE file_sha256 = %s", (file_sha,))
     for i, ch in enumerate(chunks or []):
@@ -470,7 +482,9 @@ def _keep(cur, cands: list[str], queries: dict[str, str], regex_terms: list[str]
     standalone BM25 score against each lexical query ({ranking name: score}): 0 means none
     of that query's terms occur, i.e. the ranked scan returned it as padding and it leaves
     that ranking. A regex that selected no vocabulary term selects no chunk either -
-    whatever the other rankings found."""
+    whatever the other rankings found. A chunk no file's collection holds - a page memoized
+    while its delivery is still being parsed, or one GC has not swept yet - is not content
+    anyone can be pointed to, and leaves as well."""
     if not cands or regex_terms == []:
         return {}
     exact, patterns = feeds if feeds else (None, None)
@@ -482,6 +496,7 @@ def _keep(cur, cands: list[str], queries: dict[str, str], regex_terms: list[str]
         SELECT c.sha256, {scores}
         FROM chunks c
         WHERE c.sha256 = ANY(%(cands)s)
+          AND EXISTS (SELECT 1 FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256)
           AND (%(exact)s::text[] IS NULL OR EXISTS (
                  SELECT 1 FROM files_chunks fc JOIN file_claims cl ON cl.sha256 = fc.file_sha256
                  WHERE fc.chunk_sha256 = c.sha256
@@ -650,35 +665,79 @@ def _prepared_from_parser(chunks: list[dict]) -> list[dict]:
              "meta": ch["meta"]} for ch in chunks]
 
 
+def _parse_member(path: str, data: bytes, members: dict[str, bytes], cache) -> tuple:
+    """One member on one file slot, in a member thread: parse_file's result, or the
+    unparseable verdict, in the shape process_file records. RetryLater and anything
+    unexpected propagate through the future. Touches no cursor of the worker: the gate
+    takes its own connection and the cache shares the worker's (thread-safe)."""
+    try:
+        return parse_file(path, data, members, _gate, cache)
+    except UnparseableError as e:
+        return None, {"kind": "unparseable", "error": str(e)[:200]}
+    finally:
+        _FILE_SLOTS.release()
+
+
 def process_file(cur, file_sha: str, meta: dict) -> bool:
     """One queued file delivery: unpack, parse every member that is not already complete,
     commit each, and record what the archive contains. Claims are not touched: a claim
     names the delivered sha, and file_claims resolves members through archive_members.
-    Returns False when a dependency was unavailable: the members parsed so far are
-    committed (content, complete in its own right) and the delivery is deferred."""
+
+    Members are parsed in parallel, one file slot each: a slot is waited for only while
+    none of this delivery's members is running (then we hold nothing, and the members
+    running elsewhere will release theirs), otherwise the next member starts as soon as
+    one of ours finishes or a slot elsewhere frees up. Returns False when a dependency was
+    unavailable: the members that finished are committed (content, complete in its own
+    right), nothing new is started, and the delivery is deferred."""
     data = spool_read(file_sha)
     if data is None:
         raise Unrecoverable("spool entry missing")
     # Duplicate paths inside one archive (legal in zip and tar): the last entry wins, as
     # it does on extraction. Nested archives arrive flattened, their name kept in the path.
     members = dict(to_members(data, meta.get("filename") or ""))
-    cache = ChunkCache(cur)
+    cache = ChunkCache(cur.connection)
     is_archive = not (len(members) == 1 and next(iter(members.values())) is data)
     member_sha = {path: sha(b) for path, b in members.items()}
     complete = {s: file_state(cur, s) == "complete" for s in set(member_sha.values())}
-    parsed: dict[str, tuple] = {}
-    deferred = None
+    todo, seen = [], set()
     for path, mdata in members.items():
         s = member_sha[path]
-        if complete[s] or s in parsed:
-            continue
-        try:
-            parsed[s] = parse_file(path, mdata, members, lambda name: _gate(cur, name), cache)
-        except UnparseableError as e:
-            parsed[s] = (None, {"kind": "unparseable", "error": str(e)[:200]})
-        except RetryLater as e:   # the dependency, not the document: stop, keep what is done
-            deferred = str(e)
+        if not complete[s] and s not in seen:
+            seen.add(s)
+            todo.append((s, path, mdata))
+    parsed: dict[str, tuple] = {}
+    running: dict = {}
+    deferred: str | None = None
+    failure: BaseException | None = None
+
+    def collect(done):
+        nonlocal deferred, failure
+        for fut in done:
+            s = running.pop(fut)
+            try:
+                parsed[s] = fut.result()
+            except RetryLater as e:      # the dependency, not the document: stop starting, keep what is done
+                deferred = deferred or str(e)
+            except BaseException as e:   # re-raised below, once the members in flight have finished
+                failure = failure or e
+
+    with ThreadPoolExecutor(max_workers=FILE_CONCURRENCY, thread_name_prefix="member") as ex:
+        for s, path, mdata in todo:
+            if deferred or failure:
+                break
+            while not _FILE_SLOTS.acquire(blocking=not running):
+                done, _ = wait(running, return_when=FIRST_COMPLETED)
+                collect(done)
+                if deferred or failure:
+                    break
+            else:
+                running[ex.submit(_parse_member, path, mdata, members, cache)] = s
+                continue
             break
+        if running:
+            collect(wait(running).done)
+    if failure is not None:
+        raise failure
     for s, (chunks, fmeta) in parsed.items():
         commit_file(cur, s, {**fmeta, "parser_version": PARSER_VERSION},
                     None if chunks is None else _prepared_from_parser(chunks))
@@ -697,8 +756,8 @@ def process_file(cur, file_sha: str, meta: dict) -> bool:
 
 def process_chunks(cur, file_sha: str, meta: dict) -> bool:
     """One queued chunks delivery: infer text for the render-only chunks (through the same
-    memoized, concurrent, per-chunk-verdict path as PDF pages), commit. Returns False when
-    the VLM was unavailable and the delivery was deferred."""
+    memoized, concurrent, per-chunk-verdict path as PDF pages) on one file slot, commit.
+    Returns False when the VLM was unavailable and the delivery was deferred."""
     raw = spool_read(file_sha)
     if raw is None:
         raise Unrecoverable("spool entry missing")
@@ -712,11 +771,12 @@ def process_chunks(cur, file_sha: str, meta: dict) -> bool:
             items.append(image_item(png))
             positions.append(i)
     if items:
-        try:
-            results = transcribe_pages(items, ChunkCache(cur))
-        except RetryLater as e:
-            _defer(cur, file_sha, meta, str(e))
-            return False
+        with _FILE_SLOTS:
+            try:
+                results = transcribe_pages(items, ChunkCache(cur.connection))
+            except RetryLater as e:
+                _defer(cur, file_sha, meta, str(e))
+                return False
         for i, r in zip(positions, results):
             prepared[i]["markdown"], prepared[i]["meta"] = r["markdown"], r["meta"]
     commit_file(cur, file_sha, _chunkset_meta(prepared), prepared)
@@ -728,15 +788,18 @@ TAKE_NEXT = """SELECT sha256, meta FROM files WHERE parsed_at IS NULL AND due_at
 
 
 @contextlib.contextmanager
-def _gate(cur, name: str):
-    """Serializes access to an external module across all workers and replicas: a
-    session-level advisory lock on the worker's own connection, held for the call only
-    (not for the transaction) and released with the session if the worker dies."""
-    cur.execute("SELECT pg_advisory_lock(hashtext(%s))", (name,))
-    try:
-        yield
-    finally:
-        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (name,))
+def _gate(name: str):
+    """Serializes access to an external module across all workers, member threads and
+    replicas: a session-level advisory lock on a connection of its own, held for the call
+    only and released with the session if the holder dies. Its own connection, because a
+    lock wait must never block the worker's connection, which member threads share for
+    cache lookups."""
+    with psycopg.connect(DB, autocommit=True) as conn:
+        conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (name,))
+        try:
+            yield
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(hashtext(%s))", (name,))
 
 
 def _defer(cur, file_sha: str, meta: dict, err: str):
@@ -803,7 +866,7 @@ def _parse_next(conn) -> bool:
 
 
 def parse_worker():
-    """One of PARSE_WORKERS identical threads; there is no dispatcher. The queue is
+    """One of FILE_CONCURRENCY identical threads; there is no dispatcher. The queue is
     `files.parsed_at IS NULL AND due_at <= now()` and the row lock is the claim: a worker takes
     the oldest due, unlocked row and holds that transaction open while it parses. No two workers can
     take the same row (SKIP LOCKED), a worker that dies simply drops its lock and the row is
@@ -857,6 +920,6 @@ def embed_worker():
 
 
 if os.environ.get("FATINGEST_WORKERS", "1") != "0":   # "0" = API only (tests, extra replicas)
-    for _ in range(PARSE_WORKERS):
+    for _ in range(FILE_CONCURRENCY):
         threading.Thread(target=parse_worker, daemon=True).start()
     threading.Thread(target=embed_worker, daemon=True).start()

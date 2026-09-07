@@ -68,12 +68,12 @@ services:
       - VLM_URL=${VLM_URL}                      # OpenAI-compatible multimodal chat endpoint (page transcription)
       - VLM_MODEL=${VLM_MODEL}
       - VLM_API_KEY=${VLM_API_KEY:-}            # optional bearer for VLM_URL (e.g. a gateway key)
-      - VLM_CONCURRENCY=${VLM_CONCURRENCY:-8}   # pages transcribed in parallel per parse worker
+      - VLM_CONCURRENCY=${VLM_CONCURRENCY:-8}   # pages in flight against the VLM, process-wide
       - VLM_BLANK_TOKEN=${VLM_BLANK_TOKEN:-<blank>}   # what the VLM answers for a page with nothing on it
       - VLM_VISUAL_THRESHOLD=${VLM_VISUAL_THRESHOLD:-0}   # largest drawn share of a page that may still skip the VLM
       - VLM_PROMPT_FILE=${VLM_PROMPT_FILE:-}    # optional: your own prompt (mount the file); empty = the built-in prompt.md
       - PARSER_VERSION=${PARSER_VERSION:-1}     # name of the parsing recipe in effect; change = re-index
-      - PARSE_WORKERS=${PARSE_WORKERS:-2}       # concurrent parse threads; the VLM is the bottleneck
+      - FILE_CONCURRENCY=${FILE_CONCURRENCY:-8} # files being parsed at once, process-wide (archive members count one by one)
       - PRINCIPAL_HEADER=${PRINCIPAL_HEADER:-X-Key-Alias}
       - WRITE_PRINCIPALS=${WRITE_PRINCIPALS:-}  # comma list; empty = open (trusted network)
       - READ_PRINCIPALS=${READ_PRINCIPALS:-}    # gates /search; /health is never gated

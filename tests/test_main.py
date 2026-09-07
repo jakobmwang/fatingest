@@ -254,6 +254,16 @@ check("8.5 archive_members rows cascaded away",
 check("8.6 members claimed elsewhere survive",
       q1("SELECT count(*) FROM files WHERE sha256 = ANY(%s)", [sha(md1), sha(md2)]) == 2)
 check("8.7 their chunks swept with them", g["chunks"] == 3, str(g))
+if g["chunks"] != 3:                       # which orphan's chunk survived, and who holds it?
+    with psycopg.connect(DB) as cd:
+        for name, content in (("dup2", dup2), ("deep", deep), ("notes", notes)):
+            token = content.decode().split("Token ")[1].split(".")[0].split("\n")[0]
+            rows = cd.execute("""SELECT c.sha256, (SELECT string_agg(fc.file_sha256 || ' idx' || fc.idx, ',') FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256),
+                                        pg_try_advisory_lock(0) FROM chunks c WHERE c.markdown LIKE %s""", ("%" + token + "%",)).fetchall()
+            print(f"   8.7 diag {name}: {rows}")
+        locks = cd.execute("""SELECT l.mode, l.granted, a.application_name, left(a.query, 90) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+                              JOIN pg_class r ON r.oid = l.relation WHERE r.relname = 'chunks' AND l.pid <> pg_backend_pid()""").fetchall()
+        print(f"   8.7 diag locks on chunks: {locks}")
 check("8.8 files after = before - 4", q1("SELECT count(*) FROM files") == before - 4)
 
 print("--- 9. Gotenberg: fresh LibreOffice per conversion, one at a time, verdicts")
