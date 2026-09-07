@@ -74,6 +74,9 @@ services:
       - VLM_PROMPT_FILE=${VLM_PROMPT_FILE:-}    # optional: your own prompt (mount the file); empty = the built-in prompt.md
       - PARSER_VERSION=${PARSER_VERSION:-1}     # name of the parsing recipe in effect; change = re-index
       - FILE_CONCURRENCY=${FILE_CONCURRENCY:-8} # files being parsed at once, process-wide (archive members count one by one)
+      - GC_INTERVAL=${GC_INTERVAL:-3600}        # seconds between sweeps of stale claims and what nothing refers to; 0 = never
+      - GC_STALE_DAYS=${GC_STALE_DAYS:-14}      # a claim not touched this long is gone (the deletion SLA for silent sources)
+      - STORE_SWEEP_INTERVAL=${STORE_SWEEP_INTERVAL:-86400}   # seconds between full walks of the render store and spool; 0 = never
       - PRINCIPAL_HEADER=${PRINCIPAL_HEADER:-X-Key-Alias}
       - WRITE_PRINCIPALS=${WRITE_PRINCIPALS:-}  # comma list; empty = open (trusted network)
       - READ_PRINCIPALS=${READ_PRINCIPALS:-}    # gates /search; /health is never gated

@@ -89,7 +89,7 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
     if ft and ft.mime.startswith("image/"):
         png = _normalize_image(data)
         if png is None:
-            return None, {"kind": "unparseable", "content_type": ft.mime}
+            raise UnparseableError("image cannot be decoded", {"kind": "image", "content_type": ft.mime})
         return transcribe_pages([image_item(png)], cache), {"kind": "image", "content_type": ft.mime}
 
     if ft and ft.extension in SPREADSHEET_EXTENSIONS:
@@ -97,15 +97,19 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
         return _spreadsheet_chunks(data, tables, meta, ft, gate, cache)
 
     if ft and ft.extension in OFFICE_TEXT_EXTENSIONS:
-        pdf = _gotenberg("/forms/libreoffice/convert",
-                         [("files", (f"document.{ft.extension}", data, ft.mime))], gate)
-        return parse_pdf(pdf, path, members, cache), {"kind": "office", "content_type": ft.mime}
+        meta = {"kind": "office", "content_type": ft.mime}
+        with _verdict_carries(meta):
+            pdf = _gotenberg("/forms/libreoffice/convert",
+                             [("files", (f"document.{ft.extension}", data, ft.mime))], gate)
+            return parse_pdf(pdf, path, members, cache), meta
 
     if ft and ft.extension == "pdf":
-        return parse_pdf(data, path, members, cache), {"kind": "pdf", "content_type": "application/pdf"}
+        meta = {"kind": "pdf", "content_type": "application/pdf"}
+        with _verdict_carries(meta):
+            return parse_pdf(data, path, members, cache), meta
 
     if ft:  # known binary type with no route
-        return None, {"kind": "unparseable", "content_type": ft.mime}
+        raise UnparseableError(f"no route for {ft.mime}", {"kind": "binary", "content_type": ft.mime})
 
     # --- text try-chain (no magic bytes to go on) ---
     # The latin-1 fallback in normalize_text can decode ANY byte sequence, so guard
@@ -114,7 +118,7 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
     text = normalize_text(data)
     ctrl = sum(b < 9 or 13 < b < 32 for b in text[:4096])
     if b"\x00" in text or (text and ctrl / min(len(text), 4096) > 0.10):
-        return None, {"kind": "unparseable"}
+        raise UnparseableError("binary data of no known type", {"kind": "binary"})
 
     try:
         tables, meta = tabular_to_chunks(text)
@@ -124,21 +128,32 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
 
     head = re.sub(rb"\s+", b" ", text[:2000])
     if _HTML_SNIFF_RE.search(head.decode("utf-8", "replace")):
-        g_html, assets = rewrite_for_gotenberg(path, text, members)
-        pdf = _gotenberg("/forms/chromium/convert/html",
-                         [("files", ("index.html", g_html, "text/html"))]
-                         + [("files", (n, b, "application/octet-stream")) for n, b in assets], gate)
         meta = {"kind": "html", "content_type": "text/html"}
         if (m := _TITLE_RE.search(text)):
             meta["title"] = m.group(1).decode("utf-8", "replace").strip()[:300]
-        return parse_pdf(pdf, path, members, cache), meta
+        with _verdict_carries(meta):
+            g_html, assets = rewrite_for_gotenberg(path, text, members)
+            pdf = _gotenberg("/forms/chromium/convert/html",
+                             [("files", ("index.html", g_html, "text/html"))]
+                             + [("files", (n, b, "application/octet-stream")) for n, b in assets], gate)
+            return parse_pdf(pdf, path, members, cache), meta
 
     try:
         md = text.decode("utf-8")
     except UnicodeDecodeError:
-        return None, {"kind": "unparseable"}
+        raise UnparseableError("text that is not UTF-8 and not a known encoding", {"kind": "text"})
     md = linkify_urls(rewrite_md_refs(path, md, members))
     return _text_chunks(split_markdown(md)), {"kind": "text", "content_type": "text/markdown"}
+
+
+@contextlib.contextmanager
+def _verdict_carries(meta: dict):
+    """An unparseable verdict raised inside still knows what the file is."""
+    try:
+        yield
+    except UnparseableError as e:
+        e.meta = {**meta, **e.meta}
+        raise
 
 
 def _spreadsheet_chunks(data: bytes, tables: list[dict], meta: dict, ft, gate, cache) -> tuple[list[dict], dict]:
@@ -164,22 +179,29 @@ def _spreadsheet_chunks(data: bytes, tables: list[dict], meta: dict, ft, gate, c
                 if name is not None:
                     item["meta"]["sheet"] = name
                 items.append(item)
-        described = transcribe_pages(items, cache) if items else []
-        for item, chunk in zip(items, described):
-            graphics.setdefault(item["meta"].get("sheet"), []).append(chunk)
         meta["num_drawings"] = len(items)
-    chunks: list[dict] = []
-    seen: list = []
+        for item in items:
+            graphics.setdefault(item["meta"].get("sheet"), []).append(item)
+    # The file's order: a sheet's cell chunks, then its drawings top to bottom. Fixed before
+    # transcription, so every drawing knows its position and can be written the moment it is done.
+    order: list = []
     for t in tables:
-        name = t["meta"].get("sheet")
-        if name not in seen:
-            seen.append(name)
-    for name in list(graphics):
-        if name not in seen:
-            seen.append(name)
-    for name in seen:
+        if t["meta"].get("sheet") not in order:
+            order.append(t["meta"].get("sheet"))
+    for name in graphics:
+        if name not in order:
+            order.append(name)
+    chunks: list[dict] = []
+    items, positions = [], []
+    for name in order:
         chunks += _text_chunks([t for t in tables if t["meta"].get("sheet") == name])
-        chunks += graphics.get(name, [])
+        for item in graphics.get(name, []):
+            items.append(item)
+            positions.append(len(chunks))
+            chunks.append(None)
+    if items:
+        for p, chunk in zip(positions, transcribe_pages(items, cache, positions)):
+            chunks[p] = chunk
     return chunks, meta
 
 

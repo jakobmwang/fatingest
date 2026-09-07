@@ -69,22 +69,38 @@ OpenAI-compatible multimodal embedding endpoint.
 
 ```
 items           (feed, uri PK, sha256, meta, touched_at)   -- the feed's claim: meta = what THIS feed says, sha256 = the one file it delivered
-files           (sha256 PK, meta, created_at, due_at, parsed_at, indexed_at)   -- due_at: queue position and retry backoff
+files           (sha256 PK, meta, created_at, due_at, started_at, parsed_at, failed_at, indexed_at, attempts, error)
 archive_members (archive_sha256, path PK, member_sha256)    -- what an archive contains; replaced per (re)parse
-files_chunks    (file_sha256, idx PK, chunk_sha256)         -- the file's chunk collection; replaced per (re)parse
+files_chunks    (file_sha256, idx PK, chunk_sha256, meta)   -- the file's chunk collection; replaced per (re)parse
 chunks          (sha256 PK, markdown, render_sha256, meta, embedding)   -- meta: status, error, visual, text_chars (derived, never identity)
 vocab           (surface, term PK)                          -- every (surface, index term) pair the corpus has produced
 ```
 
-`chunks.meta` is what fatingest itself observed about a chunk, for a reader deciding
-whether to look at the render or read the text: `status` (`ok`, `blank`, `unparseable`),
-`error` (the refusal, when unparseable), `source` (`text_layer` or `vlm` - which reading
-produced the text) and, for pages, `visual` (the share of the page area covered by
+A file's progress is a set of milestone dates, each set once when reached and NULL until
+then: `created_at` (the row exists: delivered, or unpacked from an archive), `due_at` (queued;
+NULL for a file never delivered on its own, pushed forward by backoff on a deferral),
+`started_at`, `parsed_at` (the parse concluded, with content or with a verdict), `failed_at`
+(given up: the delivered bytes are gone), `indexed_at` (every embeddable chunk embedded).
+`attempts` counts the deferrals and `error` is what stands in the way: the last deferral's
+cause while queued, or the verdict that the content cannot be parsed. Nothing on the row
+flips between phases, and `files.meta` holds only what the file *is*: `kind` (pdf, office,
+html, image, spreadsheet, tabular, text, archive, chunkset, binary), `content_type`,
+`parser_version`, `n_members`, and the delivery's own facts (`source`, `filename`). The
+queue is simply the rows that are delivered, not concluded, not given up and due; the
+intervals between the dates are the statistics.
+
+Meta sits where the fact belongs. `chunks.meta` is what fatingest observed about a chunk
+and cannot differ between the files holding it: `status` (`ok`, `blank`, `unparseable`),
+`error` (the VLM's refusal of this render, when unparseable), `source` (`text_layer` or `vlm`
+- which reading produced the text), for spreadsheets `sheet` with `rows` (cell chunks) or
+`region` (drawings), and, for pages, `visual` (the share of the page area covered by
 everything drawn that is not text - images, vector graphics and the annotations a viewer
 draws, such as stamps, notes and form fields - overlaps counted once, 0..1, not rounded: a
 single small mark is a small number, never zero) and `text_chars` (characters in the page's
 own text layer; `visual` 1 with `text_chars` 0 is a scan, so the transcription is pure OCR).
-Search hits carry it.
+`files_chunks.meta` is what a position in one file says about the chunk when files may
+differ: `error`, why this page of this file could not be rendered (the chunk itself is the
+shared empty verdict). Search hits carry the chunk meta.
 
 `items.meta` is free-form except one reserved key, `published_at` (ISO 8601), validated at
 ingest and used by search when `weight_recency` is set. A claim names exactly one file;
@@ -95,11 +111,17 @@ flattened at unpack, so members are always one level deep and the nesting surviv
 in the path (`a/b.zip/c.txt`). The view `file_claims (sha256, feed, uri)` resolves every
 claim a file serves, directly or through an archive; search attributes chunks with it.
 
-GC is purely referential (`SELECT fatingest_gc(interval)`): stale `items` -> `files`
-that no claim names and no archive contains (repeated until nothing is orphaned: deleting
-an archive cascades its `archive_members`, which frees its members for the next round) ->
-unreferenced `chunks` (cascade: `files_chunks`); the API extends the sweep to the render
-store.
+GC is purely referential and runs on its own (`GC_INTERVAL`, default hourly): stale
+`items` (`GC_STALE_DAYS`) -> `files` that no claim names and no archive contains (repeated
+until nothing is orphaned: deleting an archive cascades its `archive_members`, which frees
+its members for the next round) -> unreferenced `chunks` (cascade: `files_chunks`). The
+database reports what went, and the store drops exactly that: the spool entries of the
+files and the render files of the chunks, unless another chunk still points to the render.
+Nothing is ever an orphan for long, because everything a parse produces is written the
+moment it exists: an archive's members and membership when it is opened, each chunk and
+its position when its page is done. A rare full walk of the store (`STORE_SWEEP_INTERVAL`,
+default daily) catches what a crash between two steps may have left behind. `POST /v1/gc`
+runs both on demand.
 
 ## Identities
 
@@ -141,8 +163,8 @@ exponential backoff (1 min doubling, capped at 1 h, indefinitely), answering 202
 nothing partial is ever committed, members already parsed stay parsed, pages already
 transcribed are remembered (below), and the spool entry stays until the delivery settles.
 Only what no retry can fix - the delivered bytes are gone (spool entry or delivered render
-missing) - is `parse_failed`: claimed but not held, so the feed's next ping answers 404 and
-the content is retried on re-delivery. `/health` shows all three: `files_retrying`,
+missing) - is given up (`failed_at`): claimed but not held, so the feed's next ping answers
+404 and the content is retried on re-delivery. `/health` shows all three: `files_retrying`,
 `files_unparseable`, `files_failed`.
 
 ## Ingest API (POST, JSON)
@@ -250,19 +272,23 @@ cadence, while only silent disappearance at the source waits out `stale_days`.
   reports `found_by` (ranking -> rank), `sources` (feed, uri, file, idx) for attribution,
   `meta` (the chunk's verdict and page hints, see Schema) and, when recency is weighted,
   its effective `published_at`.
-- `POST /v1/gc?stale_days=14` - referential sweep of database, render store and spool; the
-  cadence is policy (the deletion SLA for sources that vanish silently), the counters are the
-  audit trail.
+- `POST /v1/gc?stale_days=` - the sweep on demand (default `GC_STALE_DAYS`), plus the full walk
+  of the store; the counters are the audit trail.
 - `GET /health` - unversioned, never gated: database ping plus the parse queue
   (`files_queued`, of which `files_retrying` are backed off), the embed queue
-  (`chunks_pending_embed`, embeddable chunks only), the verdicts (`files_unparseable`) and
-  the re-delivery backlog (`files_failed`). It deliberately never checks the VLM or embedding services, whose
+  (`chunks_pending_embed`, embeddable chunks only), the verdicts (`files_unparseable`: parsed,
+  nothing to hold) and the re-delivery backlog (`files_failed`: given up, waiting for the
+  feed). It deliberately never checks the VLM or embedding services, whose
   health belongs to their own containers.
 
 ## Deployment
 
 `docker compose up -d --build`. Configuration via `.env` - see `.env.example` for the
-full annotated list. Chat calls route happily through an OpenAI-compatible gateway
+full annotated list. Schema changes come in two kinds: additive ones (a column, an index)
+ship as a dated, idempotent file under `migrations/`, to be run once against the live
+database (`docker exec -i fatingest-db psql -U fatingest -d fatingest < migrations/<file>`),
+and `initdb/` always carries the result for new databases; anything else is a new
+database - the index is ephemeral and its feeds re-deliver. Chat calls route happily through an OpenAI-compatible gateway
 (per-key telemetry for free); the embedding endpoint must be reached directly, because
 multimodal (image+text) embeddings use a messages-format request that gateways reject
 on `/v1/embeddings`.

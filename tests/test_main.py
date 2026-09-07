@@ -347,8 +347,9 @@ check("9.3 the transcription is searchable", len(r["hits"]) == 1, str(r))
 deliver(fa, "office-bad", bad, "bad.doc")
 st, r = wait(fa, "office-bad", sha(bad))
 meta = q1("SELECT meta FROM files WHERE sha256=%s", sha(bad)) or {}
-check("9.4 a document a healthy Gotenberg refuses is unparseable: ping 200, verdict recorded",
-      st == 200 and meta.get("kind") == "unparseable" and meta.get("error", "").startswith("gotenberg "), f"{st} {meta}")
+verdict = q1("SELECT error FROM files WHERE sha256=%s", sha(bad)) or ""
+check("9.4 a document a healthy Gotenberg refuses is unparseable: ping 200, verdict in error, kind is still what the file is",
+      st == 200 and verdict.startswith("gotenberg ") and meta.get("kind") == "office", f"{st} {meta} {verdict}")
 st, h = call("GET", "/health")
 check("9.5 /health counts it under files_unparseable, nothing retrying or failed",
       h["files_unparseable"] >= 1 and h["files_retrying"] == 0 and h["files_failed"] == 0, str(h))

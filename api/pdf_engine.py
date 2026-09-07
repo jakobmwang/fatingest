@@ -79,7 +79,12 @@ _SOFT_BREAK = frozenset("\x02\ufffe")
 class UnparseableError(Exception):
     """The content cannot be parsed under this recipe: corrupt, encrypted, not what it claims
     to be - or refused by a healthy converter. Stored as complete possession of nothing; the
-    verdict is per PARSER_VERSION, so a recipe change re-parses it."""
+    verdict is per PARSER_VERSION, so a recipe change re-parses it. `meta` carries what is
+    known about the file all the same (its kind, its content type): the verdict is not a kind."""
+
+    def __init__(self, detail: str, meta: dict | None = None):
+        super().__init__(detail)
+        self.meta = meta or {}
 
 
 class RetryLater(Exception):
@@ -639,29 +644,40 @@ def transcribe(render_png: bytes, prompt: str, labels: dict[str, str] | None = N
     return md, {"status": "ok"}
 
 
-def transcribe_pages(items: list[dict], cache=None) -> list[dict]:
-    """Generative half for a list of renders, in order: [{markdown, render, meta}].
+def transcribe_pages(items: list[dict], cache=None, positions: list[int] | None = None) -> list[dict]:
+    """Generative half for a list of renders, in order: [{markdown, render, meta, position_meta?}].
     An item is {render, prompt, labels?, meta?} for the VLM, {render, markdown, meta} when
-    already resolved (text layer, blank by geometry), or {error} (an unrenderable page).
+    already resolved (text layer, blank by geometry), or {error} (an unrenderable page: the
+    chunk is the shared "nothing", the reason goes to position_meta, since it is this file's
+    page that failed).
 
-    `cache` remembers transcriptions under their chunk identity: get(render) -> (markdown,
-    meta) | None and put(render, markdown, meta). Lookups happen first, one by one; misses
-    go into the process-wide pool (identical renders once) and are stored the moment they
-    finish. A RetryLater from any page lets this call's pages in flight complete into the
-    cache, withdraws the ones not started and propagates - the retry then transcribes only
-    what is still missing. The pool itself serves everyone else meanwhile."""
+    `cache` is the file's chunk memo: get(render) -> (markdown, meta) | None, and
+    put(render, markdown, meta, positions, generated) which writes the chunk and its
+    positions in the file's collection the moment a page is done - so nothing is ever an
+    orphan, a deferred delivery resumes with its finished pages, and embedding starts while
+    the parse is still running. `positions` maps item index to position in the file
+    (default: the index itself). Lookups happen first, one by one; misses go into the
+    process-wide pool (identical renders once). A RetryLater from any page lets this call's
+    pages in flight complete into the memo, withdraws the ones not started and propagates.
+    The pool itself serves everyone else meanwhile."""
     out: list[dict | None] = [None] * len(items)
     todo: dict[str, list[int]] = {}
+    pos = positions or list(range(len(items)))
     for i, it in enumerate(items):
         if it.get("error"):
-            out[i] = {"markdown": "", "render": None, "meta": {"status": "unparseable", "error": it["error"]}}
+            out[i] = {"markdown": "", "render": None, "meta": {"status": "unparseable"},
+                      "position_meta": {"error": it["error"]}}
             continue
-        if "markdown" in it:                     # resolved without the VLM: deterministic, not memoized
+        if "markdown" in it:                     # resolved without the VLM: deterministic, its own identity
             out[i] = {"markdown": it["markdown"], "render": it["render"], "meta": it["meta"]}
+            if cache and it.get("render"):
+                cache.put(it["render"], it["markdown"], it["meta"], [pos[i]], generated=False)
             continue
         hit = cache.get(it["render"]) if cache else None
         if hit:
             out[i] = {"markdown": hit[0], "render": it["render"], "meta": hit[1]}
+            if cache:
+                cache.put(it["render"], hit[0], hit[1], [pos[i]])
         else:
             todo.setdefault(_sha(it["render"]), []).append(i)
 
@@ -670,7 +686,7 @@ def transcribe_pages(items: list[dict], cache=None) -> list[dict]:
         md, meta = transcribe(it["render"], it["prompt"], it.get("labels"))
         meta = {**meta, **(it.get("meta") or {}), "source": "vlm"}
         if cache:
-            cache.put(it["render"], md, meta)
+            cache.put(it["render"], md, meta, [pos[i] for i in idxs])
         return idxs, md, meta
 
     futures = [_VLM_POOL.submit(one, idxs) for idxs in todo.values()]

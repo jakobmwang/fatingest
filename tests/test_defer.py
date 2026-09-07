@@ -45,15 +45,17 @@ def q1(sql, *args):
 
 
 def row(s):
+    """parsed_at, {attempts, error, started_at}, seconds until due."""
     with psycopg.connect(DB) as c:
-        return c.execute("SELECT parsed_at, meta, EXTRACT(EPOCH FROM due_at - now()) FROM files WHERE sha256 = %s", (s,)).fetchone()
+        r = c.execute("SELECT parsed_at, attempts, error, started_at, EXTRACT(EPOCH FROM due_at - now()) FROM files WHERE sha256 = %s", (s,)).fetchone()
+    return (r[0], {"attempts": r[1], "error": r[2], "started_at": r[3]}, r[4]) if r else None
 
 
 def wait_attempts(s, n, timeout=60):
     t0 = time.time()
     while time.time() - t0 < timeout:
         r = row(s)
-        if r and (r[1] or {}).get("attempts") == n:
+        if r and r[1]["attempts"] == n:
             return r
         time.sleep(1)
     return row(s)
@@ -67,9 +69,9 @@ check("0.1 fixture routes to Gotenberg", filetype.guess(doc).extension == "doc")
 st, r = call("POST", "/v1/ingest/file", {"feed": feed, "uri": uri, "bytes_b64": base64.b64encode(doc).decode(), "filename": "x.doc"})
 check("1.1 delivery queued", st == 202, f"{st} {r}")
 parsed_at, meta, due_in = wait_attempts(s, 1)
-check("1.2 Gotenberg unreachable: deferred, attempt 1, still queued",
-      parsed_at is None and meta.get("attempts") == 1 and meta.get("kind") == "pending", str(meta))
-check("1.3 error names the cause", "gotenberg unhealthy" in meta.get("error", ""), meta.get("error"))
+check("1.2 Gotenberg unreachable: deferred, attempt 1, still queued, started_at set",
+      parsed_at is None and meta["attempts"] == 1 and meta["started_at"] is not None, str(meta))
+check("1.3 error names the cause", "gotenberg unhealthy" in (meta["error"] or ""), meta["error"])
 check("1.4 due in ~60 s", 45 < due_in <= 61, f"{due_in:.0f}s")
 check("1.5 spool entry kept", os.path.exists(os.path.join(STORE, "spool", s)))
 st, r = call("POST", "/v1/ingest/ping", {"feed": feed, "uri": uri, "sha256": s})
@@ -80,7 +82,7 @@ check("1.7 /health: files_retrying=1, files_failed=0", h["files_retrying"] == 1 
 st, r = call("POST", "/v1/ingest/file", {"feed": feed, "uri": uri, "bytes_b64": base64.b64encode(doc).decode(), "filename": "x.doc"})
 check("2.1 re-delivery answers 202 (not re-spooled, not re-enqueued)", st == 202 and r["status"] == "queued", f"{st} {r}")
 parsed_at, meta, due_in = wait_attempts(s, 2)
-check("2.2 the re-delivery pulled the retry forward: attempt 2 within a minute", meta.get("attempts") == 2, str(meta))
+check("2.2 the re-delivery pulled the retry forward: attempt 2 within a minute", meta["attempts"] == 2, str(meta))
 check("2.3 backoff doubled: due in ~120 s", 100 < due_in <= 121, f"{due_in:.0f}s")
 
 call("POST", "/v1/ingest/delete", {"feed": feed, "uri": uri})

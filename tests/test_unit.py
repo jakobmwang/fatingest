@@ -49,10 +49,13 @@ def run(sql, *args):
 
 
 def row(s):
-    return fetch("SELECT parsed_at, meta, EXTRACT(EPOCH FROM due_at - now()) FROM files WHERE sha256 = %s", s)
+    """parsed_at, meta, seconds until due; and the milestone columns as a dict in [3]."""
+    r = fetch("""SELECT parsed_at, meta, EXTRACT(EPOCH FROM due_at - now()), due_at, started_at, failed_at, attempts, error
+                 FROM files WHERE sha256 = %s""", s)
+    return (r[0], r[1], r[2], {"due_at": r[3], "started_at": r[4], "failed_at": r[5], "attempts": r[6], "error": r[7]}) if r else None
 
 
-assert fetch("SELECT count(*) FROM files WHERE parsed_at IS NULL")[0] == 0, "queue must be empty"
+assert fetch(f"SELECT count(*) FROM files WHERE {app.QUEUED}")[0] == 0, "queue must be empty"
 S1 = sha(f"unit-1-{time.time()}".encode())           # queued rows with no spool entry
 S2 = sha(f"unit-2-{time.time()}".encode())
 with psycopg.connect(DB) as c:
@@ -92,7 +95,7 @@ print("--- C. a worker that dies returns its row to the queue")
 c2.close()                                            # no commit: the lock is simply gone
 c5 = psycopg.connect(DB)
 r5 = c5.execute(app.TAKE_NEXT).fetchone()
-check("C.1 the row is takeable again, still pending", r5 is not None and r5[0] == S2 and r5[1].get("kind") == "pending", str(r5))
+check("C.1 the row is takeable again, still queued (delivered, not concluded)", r5 is not None and r5[0] == S2 and "kind" not in r5[1], str(r5))
 c5.rollback()
 c5.close()
 
@@ -102,11 +105,11 @@ c1.close()
 c6 = psycopg.connect(DB)
 took = app._parse_next(c6)                            # spool entry missing -> Unrecoverable -> _fail
 check("D.1 _parse_next took a row", took is True)
-meta, parsed_at = fetch("SELECT meta, parsed_at FROM files WHERE sha256 = %s", S1)
-check("D.2 the row is settled as parse_failed with the error",
-      parsed_at is not None and meta.get("kind") == "parse_failed" and "spool entry missing" in meta.get("error", ""), str(meta))
+parsed_at, meta, _, ms = row(S1)
+check("D.2 the row is given up: failed_at set, the cause in error, parsed_at untouched, no phase in meta",
+      ms["failed_at"] is not None and "spool entry missing" in (ms["error"] or "") and parsed_at is None and "kind" not in meta, f"{meta} {ms}")
 with psycopg.connect(DB) as c:
-    check("D.3 file_state: parse_failed = claimed but not held -> missing", app.file_state(c.cursor(), S1) == "missing")
+    check("D.3 file_state: given up = claimed but not held -> missing", app.file_state(c.cursor(), S1) == "missing")
 check("D.4 the worker's connection is left idle (no open transaction)",
       c6.info.transaction_status == TransactionStatus.IDLE)
 
@@ -121,7 +124,7 @@ check("E.2 the row is untouched (still queued)", fetch("SELECT parsed_at FROM fi
 cx.rollback()
 won = app._fail(cy.cursor(), S2, "now unlocked")
 cy.commit()
-check("E.3 _fail settles an unlocked row", won is True and fetch("SELECT meta->>'kind' FROM files WHERE sha256 = %s", S2)[0] == "parse_failed")
+check("E.3 _fail settles an unlocked row", won is True and row(S2)[3]["failed_at"] is not None and row(S2)[3]["error"] == "now unlocked")
 cx.close()
 cy.close()
 
@@ -167,23 +170,23 @@ def parse_raising(exc):
 
 app.parse_file = parse_raising(app.RetryLater("dep down"))
 check("H.1 _parse_next took the row", app._parse_next(c6) is True)
-parsed_at, meta, due_in = row(S4)
-check("H.2 still queued, attempt 1 recorded with the error",
-      parsed_at is None and meta.get("attempts") == 1 and meta.get("error") == "dep down" and meta.get("kind") == "pending", str(meta))
+parsed_at, meta, due_in, ms = row(S4)
+check("H.2 still queued, attempt 1 recorded with the error, started_at set, no phase in meta",
+      parsed_at is None and ms["attempts"] == 1 and ms["error"] == "dep down" and ms["started_at"] is not None and "kind" not in meta, f"{meta} {ms}")
 check("H.3 due in ~60 s", 50 < due_in <= 61, f"{due_in:.0f}s")
 check("H.4 spool entry kept for the retry", app.spool_read(S4) == md)
 check("H.5 not taken while backed off", app._parse_next(c6) is False)
 run("UPDATE files SET due_at = now() WHERE sha256 = %s", S4)
 app._parse_next(c6)
-parsed_at, meta, due_in = row(S4)
-check("H.6 second failure: attempt 2, due in ~120 s", meta.get("attempts") == 2 and 110 < due_in <= 121, f"{meta} {due_in:.0f}s")
+parsed_at, meta, due_in, ms = row(S4)
+check("H.6 second failure: attempt 2, due in ~120 s", ms["attempts"] == 2 and 110 < due_in <= 121, f"{ms} {due_in:.0f}s")
 app.parse_file = lambda *a, **k: ([{"markdown": "# Unit\n\nText for the defer test.", "render": None,
                                     "meta": {"status": "ok"}}], {"kind": "text"})
 run("UPDATE files SET due_at = now() WHERE sha256 = %s", S4)
 app._parse_next(c6)
-parsed_at, meta, _ = row(S4)
-check("H.7 success settles it: parsed, attempts gone, kind text",
-      parsed_at is not None and meta.get("kind") == "text" and "attempts" not in meta, str(meta))
+parsed_at, meta, _, ms = row(S4)
+check("H.7 success concludes it: parsed, error cleared, the two deferrals still counted, kind text, the delivery's filename kept",
+      parsed_at is not None and meta.get("kind") == "text" and ms["error"] is None and ms["attempts"] == 2 and meta.get("filename") == "u.md", f"{meta} {ms}")
 check("H.8 spool entry gone", app.spool_read(S4) is None)
 check("H.9 chunk collection written", fetch("SELECT count(*) FROM files_chunks WHERE file_sha256 = %s", S4)[0] == 1)
 
@@ -195,10 +198,10 @@ with psycopg.connect(DB) as c:
     app.enqueue(c.cursor(), SX, {"source": "file", "filename": "w.md"})
 app.parse_file = parse_raising(ValueError("boom"))
 check("H2.1 _parse_next took the row", app._parse_next(c6) is True)
-parsed_at, meta, due_in = row(SX)
+parsed_at, meta, due_in, ms = row(SX)
 check("H2.2 still queued, attempt 1, the error named as internal",
-      parsed_at is None and meta.get("attempts") == 1 and meta.get("error", "").startswith("internal: ValueError: boom")
-      and 50 < due_in <= 61, f"{meta} {due_in:.0f}s")
+      parsed_at is None and ms["attempts"] == 1 and (ms["error"] or "").startswith("internal: ValueError: boom")
+      and 50 < due_in <= 61, f"{ms} {due_in:.0f}s")
 check("H2.3 spool entry kept", app.spool_read(SX) == mdx)
 check("H2.4 nothing partial: no chunks for it, connection idle",
       fetch("SELECT count(*) FROM files_chunks WHERE file_sha256 = %s", SX)[0] == 0
@@ -206,8 +209,8 @@ check("H2.4 nothing partial: no chunks for it, connection idle",
 app.parse_file = lambda *a, **k: ([{"markdown": "# Unit internal", "render": None, "meta": {"status": "ok"}}], {"kind": "text"})
 run("UPDATE files SET due_at = now() WHERE sha256 = %s", SX)
 app._parse_next(c6)
-parsed_at, meta, _ = row(SX)
-check("H2.5 the next release fixes it: settled, attempts gone", parsed_at is not None and meta.get("kind") == "text" and "attempts" not in meta, str(meta))
+parsed_at, meta, _, ms = row(SX)
+check("H2.5 the next release fixes it: concluded, error cleared", parsed_at is not None and meta.get("kind") == "text" and ms["error"] is None, f"{meta} {ms}")
 
 print("--- I. a healthy converter's refusal is unparseable under this recipe")
 md5 = b"# Unit five\n"
@@ -215,11 +218,11 @@ S5 = sha(md5)
 app.spool_write(S5, md5)
 with psycopg.connect(DB) as c:
     app.enqueue(c.cursor(), S5, {"source": "file", "filename": "v.md"})
-app.parse_file = parse_raising(app.UnparseableError("gotenberg 500: LibreOffice failed to convert"))
+app.parse_file = parse_raising(app.UnparseableError("gotenberg 500: LibreOffice failed to convert", {"kind": "office"}))
 app._parse_next(c6)
-parsed_at, meta, _ = row(S5)
-check("I.1 settled as unparseable with the converter's answer",
-      parsed_at is not None and meta.get("kind") == "unparseable" and meta.get("error", "").startswith("gotenberg 500"), str(meta))
+parsed_at, meta, _, ms = row(S5)
+check("I.1 concluded with the verdict: parsed_at set, the converter's answer in error, kind stays what the file is",
+      parsed_at is not None and (ms["error"] or "").startswith("gotenberg 500") and meta.get("kind") == "office" and ms["failed_at"] is None, f"{meta} {ms}")
 with psycopg.connect(DB) as c:
     check("I.2 file_state: complete possession of nothing", app.file_state(c.cursor(), S5) == "complete")
 check("I.3 spool entry gone", app.spool_read(S5) is None)
@@ -238,12 +241,12 @@ with psycopg.connect(DB) as c:
 real_vlm = pdf_engine.vlm
 pdf_engine.vlm = parse_raising(app.RetryLater("vlm 503: upstream down"))
 app._parse_next(c6)
-parsed_at, meta, due_in = row(S6)
-check("J.1 VLM unavailable: deferred, attempt 1", parsed_at is None and meta.get("attempts") == 1 and 50 < due_in <= 61, str(meta))
+parsed_at, meta, due_in, ms = row(S6)
+check("J.1 VLM unavailable: deferred, attempt 1", parsed_at is None and ms["attempts"] == 1 and 50 < due_in <= 61, str(ms))
 pdf_engine.vlm = lambda png, prompt: "described by the vlm"
 run("UPDATE files SET due_at = now() WHERE sha256 = %s", S6)
 app._parse_next(c6)
-parsed_at, meta, _ = row(S6)
+parsed_at, meta, _, _ = row(S6)
 md_text = fetch("SELECT c.markdown, c.meta FROM files_chunks fc JOIN chunks c ON c.sha256 = fc.chunk_sha256 WHERE fc.file_sha256 = %s", S6)
 check("J.2 VLM back: settled as chunkset with the generated text, status ok and the VLM as its source",
       parsed_at is not None and meta.get("kind") == "chunkset" and md_text and md_text[0] == "described by the vlm"
@@ -260,7 +263,7 @@ with psycopg.connect(DB) as c:
     app.enqueue(c.cursor(), S7, {"source": "chunks"})
 pdf_engine.vlm = parse_raising(app.UnparseableError("vlm 400: image too large"))
 app._parse_next(c6)
-parsed_at, meta, _ = row(S7)
+parsed_at, meta, _, _ = row(S7)
 rows7 = None
 with psycopg.connect(DB) as c:
     rows7 = c.execute("""SELECT fc.idx, c.markdown, c.meta FROM files_chunks fc JOIN chunks c ON c.sha256 = fc.chunk_sha256
@@ -357,8 +360,8 @@ check("M.3 the blank page: empty text, status blank", out[3]["markdown"] == ""
 check("M.4 page hints merged into meta, and the VLM is named as the source",
       out[0]["meta"] == {"status": "ok", "visual": 0.5, "text_chars": 10, "source": "vlm"} and out[0]["markdown"] == "text 0", str(out[0]["meta"]))
 _pool(2); out_e = pdf_engine.transcribe_pages([{"error": "cannot render page: X"}, items[0]], None)
-check("M.5 an unrenderable page is a verdict in place: no render, status unparseable",
-      out_e[0] == {"markdown": "", "render": None, "meta": {"status": "unparseable", "error": "cannot render page: X"}}
+check("M.5 an unrenderable page is a verdict in place: no render, status unparseable, the reason with the position",
+      out_e[0] == {"markdown": "", "render": None, "meta": {"status": "unparseable"}, "position_meta": {"error": "cannot render page: X"}}
       and out_e[1]["markdown"] == "text 0")
 calls.clear()
 _pool(4); pdf_engine.transcribe_pages([items[0], items[2], items[0]], None)
@@ -383,7 +386,7 @@ class FakeCache:
     def get(self, render):
         return self.store.get(sha(render))
 
-    def put(self, render, md, meta):
+    def put(self, render, md, meta, positions, generated=True):
         self.store[sha(render)] = (md, meta)
 
 
@@ -418,30 +421,35 @@ check("M.12 memoized pages come back with their stored text and verdict",
       and all(o["meta"]["status"] == "ok" for o in out))
 pdf_engine.vlm = real_vlm
 
-print("--- N. ChunkCache: a looked-up chunk is safe from GC until the collection commits")
+print("--- N. ChunkCache: a finished page is written with its position at once, never an orphan")
 r_n = png((7, 77, 177))
+F_N = sha(f"unit-file-n-{time.time()}".encode())
+run("INSERT INTO files(sha256, meta) VALUES (%s, %s)", F_N, json.dumps({"kind": "pdf"}))
+run("INSERT INTO items(feed, uri, sha256, meta) VALUES ('unit/feed', %s, %s, '{}')", "memo-" + F_N[:8], F_N)   # claimed, as a delivery is
 cn = psycopg.connect(DB)
-cur_n = cn.cursor()
-cc = app.ChunkCache(cn)
-cc.put(r_n, "memo text", {"status": "ok", "visual": 0.1, "text_chars": 9})
+cc = app.ChunkCache(cn, F_N)
+cc.put(r_n, "memo text", {"status": "ok", "visual": 0.1, "text_chars": 9}, [3, 5])
 cid_n = app.chunk_id(None, sha(r_n), True)
 check("N.1 put writes the chunk row at once (own connection) and the render to disk",
       fetch("SELECT markdown FROM chunks WHERE sha256 = %s", cid_n) == ("memo text",) and os.path.exists(app.render_path(sha(r_n))))
+check("N.2 ... and the file's positions that hold it, so the chunk is referenced from the first second",
+      fetch("SELECT array_agg(idx ORDER BY idx) FROM files_chunks WHERE file_sha256 = %s AND chunk_sha256 = %s", F_N, cid_n)[0] == [3, 5])
 hit = cc.get(r_n)
-check("N.2 get returns text and verdict", hit == ("memo text", {"status": "ok", "visual": 0.1, "text_chars": 9}), str(hit))
-gc1 = fetch("SELECT fatingest_gc(interval '0')")[0]
-check("N.3 GC skips the row the worker holds under KEY SHARE", fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 1, str(gc1))
-cn.rollback()
-gc2 = fetch("SELECT fatingest_gc(interval '0')")[0]
-check("N.4 released, the orphan is swept", fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 0, str(gc2))
-check("N.5 get on a missing chunk is None", cc.get(r_n) is None)
-cc.put(r_n, "memo text", {"status": "ok"})
+check("N.3 get returns text and verdict", hit == ("memo text", {"status": "ok", "visual": 0.1, "text_chars": 9}), str(hit))
+gc1 = fetch("SELECT fatingest_gc(interval '1 day')")[0]
+check("N.4 GC leaves it alone: it is held by a file somebody claims", fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 1, str({k: v for k, v in gc1.items() if not k.startswith("gone")}))
 _got = []
 _t = threading.Thread(target=lambda: _got.append(cc.get(r_n))); _t.start(); _t.join()
-check("N.6 a member thread looks up on the worker's connection, and the lock lands in the worker's transaction",
-      _got and _got[0][0] == "memo text" and fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 1
-      and (fetch("SELECT fatingest_gc(interval '0')"), fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0])[1] == 1)
-cn.rollback(); fetch("SELECT fatingest_gc(interval '0')")
+check("N.5 a member thread looks up on the worker's connection", _got and _got[0][0] == "memo text")
+cc.put(r_n, "newer text for the same position", {"status": "ok"}, [3])
+check("N.6 a position taken again points at the new chunk (a re-parse replaces as it goes)",
+      fetch("SELECT chunk_sha256 FROM files_chunks WHERE file_sha256 = %s AND idx = 3", F_N)[0] == cid_n)   # same identity: render + recipe
+run("DELETE FROM items WHERE sha256 = %s", F_N)
+gc2 = fetch("SELECT fatingest_gc(interval '1 day')")[0]
+check("N.7 the claim withdrawn: file, collection and chunk go in one sweep, and GC names the render as gone",
+      fetch("SELECT count(*) FROM files WHERE sha256 = %s", F_N)[0] == 0 and fetch("SELECT count(*) FROM chunks WHERE sha256 = %s", cid_n)[0] == 0
+      and sha(r_n) in (gc2.get("gone_renders") or []) and F_N in (gc2.get("gone_files") or []), str({k: v for k, v in gc2.items() if not k.startswith("gone")}))
+check("N.8 get on a missing chunk is None", cc.get(r_n) is None)
 cn.close()
 
 print("--- O. the text-layer route: guard, link rewriting, identity")
@@ -707,11 +715,15 @@ def _fake_parse(path, data, members, gate, cache):
             _act["now"] -= 1
 
 
+T_MEMBERS: list = []          # every member sha these fixtures create, for the cleanup
+
+
 def _zip(members):
     b = io.BytesIO()
     with _zipfile.ZipFile(b, "w") as z:
         for name, data in members.items():
             z.writestr(name, data)
+            T_MEMBERS.append(sha(data))
     return b.getvalue()
 
 
@@ -743,12 +755,14 @@ check("T.3 with two file slots, never more than two members run at once (three r
 ct.close()
 app._FILE_SLOTS = threading.Semaphore(app.FILE_CONCURRENCY)
 ok, dt, ct, z3 = _deliver_and_parse(_zip({"a.txt": f"good a {RUN_T}".encode(), "b.txt": f"DEFER {RUN_T}".encode(), "c.txt": f"good c {RUN_T}".encode()}), f"t3-{RUN_T}")
-row = fetch("SELECT parsed_at IS NULL, due_at > now(), meta->>'attempts', meta->>'error' FROM files WHERE sha256 = %s", z3)
+row = fetch("SELECT parsed_at IS NULL, due_at > now(), attempts::text, error FROM files WHERE sha256 = %s", z3)
 good = fetch("SELECT count(*) FROM files WHERE sha256 = ANY(%s) AND parsed_at IS NOT NULL", [sha(f"good a {RUN_T}".encode()), sha(f"good c {RUN_T}".encode())])[0]
 check("T.4 one member's dependency failure defers the delivery with backoff, nothing new is started",
       ok is False and row[0] and row[1] and row[2] == "1" and "vlm unreachable" in (row[3] or ""), str(row))
-check("T.5 the members that finished are committed all the same, and the archive is not", good == 2
-      and fetch("SELECT count(*) FROM archive_members WHERE archive_sha256 = %s", z3)[0] == 0, f"good={good}")
+check("T.5 the members that finished are committed all the same; the archive is not concluded, but its membership is already written and its members exist",
+      good == 2 and fetch("SELECT parsed_at IS NULL FROM files WHERE sha256 = %s", z3)[0]
+      and fetch("SELECT count(*) FROM archive_members WHERE archive_sha256 = %s", z3)[0] == 3
+      and fetch("SELECT count(*) FROM files WHERE sha256 = %s AND due_at IS NULL AND parsed_at IS NULL", sha(f"DEFER {RUN_T}".encode()))[0] == 1, f"good={good}")
 ct.close()
 ok, dt, ct, z4 = _deliver_and_parse(_zip({"x.txt": f"good x {RUN_T}".encode(), "y.txt": f"BOOM {RUN_T}".encode()}), f"t4-{RUN_T}")
 check("T.6 an unexpected error in a member surfaces to the worker after the others finished (deferred as internal there)",
@@ -756,8 +770,8 @@ check("T.6 an unexpected error in a member surfaces to the worker after the othe
 ct.close()
 app.parse_file = _real_parse_file
 with psycopg.connect(DB) as c:
-    c.execute("DELETE FROM files WHERE sha256 = ANY(%s)", ([z1, z2, z3, z4],))
-    c.execute("DELETE FROM files f WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.sha256 = f.sha256) AND NOT EXISTS (SELECT 1 FROM archive_members am WHERE am.member_sha256 = f.sha256) AND f.meta->>'kind' = 'text' AND f.sha256 IN (SELECT sha256 FROM files WHERE created_at > now() - interval '5 minutes')")
+    c.execute("DELETE FROM files WHERE sha256 = ANY(%s)", ([z1, z2, z3, z4],))      # cascades their membership
+    c.execute("DELETE FROM files WHERE sha256 = ANY(%s)", (T_MEMBERS,))              # the members, parsed or not
     c.execute("DELETE FROM chunks c WHERE NOT EXISTS (SELECT 1 FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256)")
 for z in (z1, z2, z3, z4):
     app.spool_delete(z)

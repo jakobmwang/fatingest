@@ -120,17 +120,27 @@ LANGUAGE sql IMMUTABLE AS $$
     SELECT l.lexeme, l.lexeme FROM rest, unnest(to_tsvector('simple', public.fatingest_norm(rest.t))) l
 $$;
 
--- Content rows are immutable and content-addressed.
+-- Content rows are immutable and content-addressed. A file's progress is a set of milestone
+-- dates, each set once when reached and NULL until then - never a phase value that flips
+-- from one thing to another. meta holds intrinsic facts only: kind (what the file IS: pdf,
+-- office, archive, spreadsheet, text, image, chunkset...), content_type, parser_version,
+-- n_members, and the delivery's own facts (source, filename).
 CREATE TABLE files (
     sha256      TEXT PRIMARY KEY,
-    meta        JSONB NOT NULL DEFAULT '{}',            -- intrinsic facts: kind, content type, parser_version;
-                                                        -- while queued: attempts, error (dependency retries)
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    due_at      TIMESTAMPTZ NOT NULL DEFAULT now(),     -- queue position; pushed forward by backoff when a dependency fails
-    parsed_at   TIMESTAMPTZ,                            -- NULL = queued for the parse workers
-    indexed_at  TIMESTAMPTZ
+    meta        JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),     -- the row exists: delivered, or unpacked from an archive
+    due_at      TIMESTAMPTZ,                            -- queued: NULL for a file never delivered on its own (an
+                                                        -- archive member); pushed forward by backoff on a deferral
+    started_at  TIMESTAMPTZ,                            -- a parse began
+    parsed_at   TIMESTAMPTZ,                            -- the parse concluded: content committed, or the verdict below
+    failed_at   TIMESTAMPTZ,                            -- given up: the delivered bytes are gone, only a re-delivery helps
+    indexed_at  TIMESTAMPTZ,                            -- every embeddable chunk embedded
+    attempts    INTEGER NOT NULL DEFAULT 0,             -- parse attempts that ended in a deferral
+    error       TEXT                                    -- what stands in the way: the last deferral's cause while
+                                                        -- queued, or the verdict that the content cannot be parsed
 );
-CREATE INDEX idx_files_due ON files(due_at) WHERE parsed_at IS NULL;
+-- The queue: delivered, not concluded, not given up, due.
+CREATE INDEX idx_files_due ON files(due_at) WHERE parsed_at IS NULL AND failed_at IS NULL;
 CREATE INDEX idx_files_unindexed ON files(parsed_at) WHERE parsed_at IS NOT NULL AND indexed_at IS NULL;
 
 -- A feed's claim about a uri: meta is what THIS feed says (title, tags, ...), sha256 is
@@ -207,6 +217,9 @@ CREATE TABLE files_chunks (
     file_sha256   TEXT NOT NULL REFERENCES files(sha256) ON DELETE CASCADE,
     idx           INTEGER NOT NULL,                     -- 0-based position, not a page number
     chunk_sha256  TEXT NOT NULL REFERENCES chunks(sha256),
+    meta          JSONB NOT NULL DEFAULT '{}',          -- what this position in this file says about the chunk, when it
+                                                        -- can differ between files holding the same chunk: e.g. error,
+                                                        -- why this page could not be rendered
     PRIMARY KEY (file_sha256, idx)                      -- (file, idx), NOT (file, chunk): identical pages may repeat
 );
 CREATE INDEX idx_files_chunks_chunk ON files_chunks(chunk_sha256);
@@ -232,26 +245,37 @@ CREATE VIEW file_claims AS
 -- run - GC never waits on a worker, like everything else on the request path.
 -- Explicit deletions and replacements leave orphans behind immediately, so they propagate
 -- at GC cadence; only silent disappearance at the source waits out the stale interval.
+-- Returns what it removed, and what the store may now drop: the shas of the files that went
+-- (their spool entries) and the render shas of the chunks that went (the API deletes the
+-- render files no remaining chunk points to - a render can be shared across recipes).
 CREATE OR REPLACE FUNCTION fatingest_gc(stale INTERVAL) RETURNS JSONB
 LANGUAGE plpgsql AS $$
 DECLARE n_i BIGINT; n_f BIGINT := 0; n_c BIGINT; n BIGINT;
+        gone_files TEXT[] := '{}'; batch TEXT[]; renders TEXT[];
 BEGIN
     DELETE FROM items WHERE touched_at < now() - stale;
     GET DIAGNOSTICS n_i = ROW_COUNT;
     LOOP
-        DELETE FROM files WHERE sha256 IN (
-            SELECT f.sha256 FROM files f
-             WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.sha256 = f.sha256)
-               AND NOT EXISTS (SELECT 1 FROM archive_members am WHERE am.member_sha256 = f.sha256)
-             FOR UPDATE SKIP LOCKED);
-        GET DIAGNOSTICS n = ROW_COUNT;
+        WITH gone AS (
+            DELETE FROM files WHERE sha256 IN (
+                SELECT f.sha256 FROM files f
+                 WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.sha256 = f.sha256)
+                   AND NOT EXISTS (SELECT 1 FROM archive_members am WHERE am.member_sha256 = f.sha256)
+                 FOR UPDATE SKIP LOCKED)
+            RETURNING sha256)
+        SELECT count(*), coalesce(array_agg(sha256), '{}') INTO n, batch FROM gone;
         n_f := n_f + n;
+        gone_files := gone_files || batch;
         EXIT WHEN n = 0;
     END LOOP;
-    DELETE FROM chunks WHERE sha256 IN (
-        SELECT c.sha256 FROM chunks c
-         WHERE NOT EXISTS (SELECT 1 FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256)
-         FOR UPDATE SKIP LOCKED);
-    GET DIAGNOSTICS n_c = ROW_COUNT;
-    RETURN jsonb_build_object('items', n_i, 'files', n_f, 'chunks', n_c);
+    WITH gone AS (
+        DELETE FROM chunks WHERE sha256 IN (
+            SELECT c.sha256 FROM chunks c
+             WHERE NOT EXISTS (SELECT 1 FROM files_chunks fc WHERE fc.chunk_sha256 = c.sha256)
+             FOR UPDATE SKIP LOCKED)
+        RETURNING render_sha256)
+    SELECT count(*), coalesce(array_agg(DISTINCT render_sha256) FILTER (WHERE render_sha256 IS NOT NULL), '{}')
+      INTO n_c, renders FROM gone;
+    RETURN jsonb_build_object('items', n_i, 'files', n_f, 'chunks', n_c,
+                              'gone_files', to_jsonb(gone_files), 'gone_renders', to_jsonb(renders));
 END $$;
