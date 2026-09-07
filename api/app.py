@@ -936,7 +936,7 @@ def _take(cur, file_sha: str) -> bool:
 def _fail(cur, file_sha: str, err: str) -> bool:
     """Gives a delivery up: only a re-delivery can fix it (the bytes are gone), so failed_at
     is set, the cause recorded, and the feed's ping answers 404 from here on."""
-    _log("parse_failed", sha256=file_sha, err=err[:200])
+    _log("parse_given_up", sha256=file_sha, err=err[:200])
     if not _take(cur, file_sha):
         return False
     cur.execute("UPDATE files SET failed_at = clock_timestamp(), error = %s WHERE sha256 = %s", (err[:200], file_sha))

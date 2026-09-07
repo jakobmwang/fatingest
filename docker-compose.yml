@@ -65,6 +65,7 @@ services:
       - EMBED_DIM=${EMBED_DIM:-1024}            # must match vector(N) in initdb/01-schema.sql
       - GOTENBERG_URL=http://gotenberg:3000
       - GOTENBERG_TIMEOUT=300                   # client side; must exceed GOTENBERG_API_TIMEOUT so Gotenberg's verdict decides
+      - GOTENBERG_HEALTH_WAIT=${GOTENBERG_HEALTH_WAIT:-60}   # seconds to wait for Gotenberg's health before a call (it restarts LibreOffice after every conversion)
       - VLM_URL=${VLM_URL}                      # OpenAI-compatible multimodal chat endpoint (page transcription)
       - VLM_MODEL=${VLM_MODEL}
       - VLM_API_KEY=${VLM_API_KEY:-}            # optional bearer for VLM_URL (e.g. a gateway key)
