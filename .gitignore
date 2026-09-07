@@ -1,0 +1,7 @@
+.env
+store/
+__pycache__/
+*.pyc
+# Fonts are often license-restricted and deployment-specific; keep only the directory.
+gotenberg/fonts/*
+!gotenberg/fonts/.gitkeep

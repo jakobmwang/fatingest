@@ -1,0 +1,95 @@
+services:
+  db:
+    image: timescale/timescaledb-ha:pg17        # ships pgvector + pgvectorscale + pg_textsearch
+    container_name: fatingest-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=fatingest
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=fatingest
+    volumes:
+      - pgdata:/home/postgres/pgdata/data       # named volume: the image runs as uid 1000, bind mounts cause permission issues
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fatingest -d fatingest"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - dbnet
+
+  gotenberg:
+    build: ./gotenberg
+    image: fatingest-gotenberg:8
+    container_name: fatingest-gotenberg
+    restart: unless-stopped
+    command:                                    # Gotenberg reads FLAGS only - GOTENBERG_* environment variables are
+      - gotenberg                               # silently ignored (verified against 8.36.0)
+      - --api-timeout=240s                      # a conversion that needs longer is unparseable under this recipe
+      - --libreoffice-restart-after=1           # a fresh LibreOffice per conversion (~0.3 s): nothing accumulates,
+      - --chromium-restart-after=1              #   so a failure from a healthy Gotenberg is the document's own
+      - --libreoffice-start-timeout=60s
+      - --libreoffice-auto-start=true
+      - --chromium-auto-start=true
+    deploy:
+      resources:
+        limits:
+          memory: 4g                              # one conversion at a time (fatingest serializes): the budget is per document
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks:
+      - convertnet    # internal-only: Chromium/LibreOffice can never reach the outside,
+                      # so external references fail deterministically (assetless rendering
+                      # is enforced by the network, not by flags)
+
+  api:
+    build: ./api
+    image: fatingest-api:dev
+    container_name: fatingest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8100:8000"                   # local admin only; public access goes through the reverse proxy
+    volumes:
+      - ./store:/store                          # renders/ (content-addressed) and spool/ (transient)
+    environment:
+      - DATABASE_URL=postgresql://fatingest:${POSTGRES_PASSWORD}@db:5432/fatingest
+      - EMBED_URL=${EMBED_URL}                  # OpenAI-compatible multimodal embeddings endpoint
+      - EMBED_API_KEY=${EMBED_API_KEY:-}        # optional bearer for EMBED_URL
+      - EMBED_MODEL=${EMBED_MODEL:-Qwen/Qwen3-VL-Embedding-8B}
+      - EMBED_DIM=${EMBED_DIM:-1024}            # must match vector(N) in initdb/01-schema.sql
+      - GOTENBERG_URL=http://gotenberg:3000
+      - GOTENBERG_TIMEOUT=300                   # client side; must exceed GOTENBERG_API_TIMEOUT so Gotenberg's verdict decides
+      - VLM_URL=${VLM_URL}                      # OpenAI-compatible multimodal chat endpoint (page transcription)
+      - VLM_MODEL=${VLM_MODEL}
+      - VLM_API_KEY=${VLM_API_KEY:-}            # optional bearer for VLM_URL (e.g. a gateway key)
+      - VLM_CONCURRENCY=${VLM_CONCURRENCY:-8}   # pages transcribed in parallel per parse worker
+      - VLM_BLANK_TOKEN=${VLM_BLANK_TOKEN:-<blank>}   # what the VLM answers for a page with nothing on it
+      - VLM_VISUAL_THRESHOLD=${VLM_VISUAL_THRESHOLD:-0}   # largest drawn share of a page that may still skip the VLM
+      - VLM_PROMPT_FILE=${VLM_PROMPT_FILE:-}    # optional: your own prompt (mount the file); empty = the built-in prompt.md
+      - PARSER_VERSION=${PARSER_VERSION:-1}     # name of the parsing recipe in effect; change = re-index
+      - PARSE_WORKERS=${PARSE_WORKERS:-2}       # concurrent parse threads; the VLM is the bottleneck
+      - PRINCIPAL_HEADER=${PRINCIPAL_HEADER:-X-Key-Alias}
+      - WRITE_PRINCIPALS=${WRITE_PRINCIPALS:-}  # comma list; empty = open (trusted network)
+      - READ_PRINCIPALS=${READ_PRINCIPALS:-}    # gates /search; /health is never gated
+    networks:
+      - dbnet
+      - convertnet
+      - proxy
+
+volumes:
+  pgdata:
+
+networks:
+  dbnet:
+    internal: true
+  convertnet:
+    internal: true
+  proxy:
+    external: true
+    name: caddy_proxy
