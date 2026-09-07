@@ -266,6 +266,46 @@ if g["chunks"] != 3:                       # which orphan's chunk survived, and 
         print(f"   8.7 diag locks on chunks: {locks}")
 check("8.8 files after = before - 4", q1("SELECT count(*) FROM files") == before - 4)
 
+print("--- 8b. a spreadsheet with a chart and a picture: cells exact, drawings as chunks of their own")
+from openpyxl import Workbook as _Wb                                    # noqa: E402
+from openpyxl.chart import BarChart as _Bar, Reference as _Ref          # noqa: E402
+from openpyxl.drawing.image import Image as _XLImage                    # noqa: E402
+from PIL import Image as _PILImage, ImageDraw as _Draw                  # noqa: E402
+_wb = _Wb(); _ws = _wb.active; _ws.title = "Budget"
+_ws.append(("Year", "Revenue", "Cost"))
+for _y, _r, _c in ((2021, 120, 90), (2022, 135, 97), (2023, 150, 110), (2024, 162, 118)):
+    _ws.append((_y, _r, _c))
+_ws["A7"] = f"Token SHEETCELL{RUN}"
+_ch = _Bar(); _ch.title = f"Revenue vs cost {RUN}"; _ch.add_data(_Ref(_ws, min_col=2, min_row=1, max_col=3, max_row=5), titles_from_data=True)
+_ch.set_categories(_Ref(_ws, min_col=1, min_row=2, max_row=5)); _ws.add_chart(_ch, "E2")
+_im = _PILImage.new("RGB", (240, 120), "white"); _Draw.Draw(_im).rectangle((10, 10, 230, 110), outline="red", width=6); _Draw.Draw(_im).text((30, 50), f"STAMP {RUN}", fill="red")
+_ib = io.BytesIO(); _im.save(_ib, "PNG"); _ib.seek(0); _ws.add_image(_XLImage(_ib), "E20")
+_w2 = _wb.create_sheet("Plain"); _w2.append(("Item", "Qty")); _w2.append(("Chairs", 12))
+_xb = io.BytesIO(); _wb.save(_xb); xlsx = _xb.getvalue()
+st, r = deliver(fa, "budget-book", xlsx, "budget.xlsx")
+st, r = wait(fa, "budget-book", sha(xlsx), timeout=300)
+check("8b.1 the workbook parses", st == 200, f"{st} {r}")
+rows = q("""SELECT fc.idx, c.markdown, c.meta, c.render_sha256 FROM files_chunks fc JOIN chunks c ON c.sha256 = fc.chunk_sha256
+            WHERE fc.file_sha256 = %s ORDER BY fc.idx""", sha(xlsx))
+fmeta = q1("SELECT meta FROM files WHERE sha256 = %s", sha(xlsx))
+cells = [x for x in rows if x[3] is None]; drawings = [x for x in rows if x[3] is not None]
+check("8b.2 two cell chunks (one per sheet) with sheet and row range in meta, values exact (the empty row 6 is no row)",
+      [x[2].get("sheet") for x in cells] == ["Budget", "Plain"] and cells[0][2].get("rows") == [1, 5] and "| 2023 | 150 | 110 |" in cells[0][1]
+      and f"SHEETCELL{RUN}" in cells[0][1], str([(x[0], x[2]) for x in cells]))
+check("8b.3 two drawings became chunks of their own, both on sheet Budget, transcribed by the VLM, with their position",
+      len(drawings) == 2 and all(x[2].get("sheet") == "Budget" and x[2].get("source") == "vlm" and x[2].get("status") == "ok"
+                                 and isinstance(x[2].get("region"), list) and len(x[2]["region"]) == 4 for x in drawings), str([(x[0], x[2]) for x in drawings]))
+check("8b.4 order: Budget's cells, then its drawings top to bottom, then Plain's cells",
+      [x[0] for x in cells] == [0, 3] and [x[0] for x in drawings] == [1, 2] and drawings[0][2]["region"][3] > drawings[1][2]["region"][3], str([x[0] for x in rows]))
+check("8b.5 the chart's transcription names the years, the picture's the stamp",
+      any(y in drawings[0][1] for y in ("2021", "2024")) and "STAMP" in drawings[1][1].upper(), f"{drawings[0][1][:120]!r} | {drawings[1][1][:120]!r}")
+check("8b.6 the file meta counts the drawings", fmeta.get("num_drawings") == 2 and fmeta.get("num_sheets") == 2, str(fmeta))
+plain_wb = _Wb(); plain_wb.active.append(("a", "b")); plain_wb.active.append((1, 2)); plain_wb.active["A4"] = f"PLAIN{RUN}"
+_pb = io.BytesIO(); plain_wb.save(_pb); plain_xlsx = _pb.getvalue()
+st, r = deliver(fa, "plain-book", plain_xlsx, "plain.xlsx"); st, r = wait(fa, "plain-book", sha(plain_xlsx), timeout=120)
+pm = q1("SELECT meta FROM files WHERE sha256 = %s", sha(plain_xlsx))
+check("8b.7 a workbook without drawings never goes near LibreOffice: no drawings counted", st == 200 and "num_drawings" not in pm, str(pm))
+
 print("--- 9. Gotenberg: fresh LibreOffice per conversion, one at a time, verdicts")
 
 

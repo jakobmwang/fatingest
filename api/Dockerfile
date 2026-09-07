@@ -10,6 +10,6 @@ RUN useradd -m -u ${APP_UID} fatingest
 USER fatingest
 WORKDIR /app
 COPY app.py models.py store.py archive_to_files.py unpack.py refs.py pdf_engine.py \
-     text_utils.py tabular.py routing.py prompt.md ./
+     text_utils.py tabular.py routing.py sheets.py prompt.md ./
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

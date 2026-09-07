@@ -4,5 +4,5 @@
 ARG BASE=fatingest-api:dev
 FROM ${BASE}
 USER root
-RUN pip install --no-cache-dir pymupdf
+RUN pip install --no-cache-dir pymupdf openpyxl
 USER fatingest

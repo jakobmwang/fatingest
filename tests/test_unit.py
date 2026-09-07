@@ -770,6 +770,67 @@ with psycopg.connect(DB) as cu:
     check("U.1 _keep drops a chunk without a files_chunks row, so search never has to describe it", kept == {}, str(kept))
     cu.execute("DELETE FROM chunks WHERE sha256 = %s", (orphan,))
 
+print("--- V. spreadsheets: what is drawn becomes its own chunk")
+import zipfile as _zf                                                   # noqa: E402
+import xml.etree.ElementTree as _ET                                     # noqa: E402
+from openpyxl import Workbook as _Wb                                    # noqa: E402
+from openpyxl.chart import BarChart as _Bar, Reference as _Ref          # noqa: E402
+from openpyxl.styles import PatternFill as _Fill                        # noqa: E402
+import sheets, tabular                                                  # noqa: E402
+
+
+def _xlsx(chart=False, hidden=False, fills=False, rows=4):
+    wb = _Wb(); ws = wb.active; ws.title = "Data"
+    ws.append(("Year", "Value"))
+    for i in range(rows):
+        ws.append((2020 + i, 100 + i))
+    if fills:
+        for c in ws[1]:
+            c.fill = _Fill("solid", fgColor="FFFF00")
+    if chart:
+        ch = _Bar(); ch.add_data(_Ref(ws, min_col=2, min_row=1, max_row=rows + 1), titles_from_data=True); ws.add_chart(ch, "D2")
+    w2 = wb.create_sheet("Notes"); w2.append(("a", "b"))
+    if hidden:
+        w2.sheet_state = "hidden"
+    b = io.BytesIO(); wb.save(b); return b.getvalue()
+
+
+plain, drawn, hid = _xlsx(), _xlsx(chart=True, fills=True), _xlsx(hidden=True)
+check("V.1 a workbook without drawings is seen as such from its structure; one with a chart is not",
+      sheets.is_ooxml_workbook(plain) and not sheets.has_drawings(plain) and sheets.has_drawings(drawn))
+check("V.2 sheet names come in workbook order, hidden sheets left out",
+      sheets.visible_sheets(plain) == ["Data", "Notes"] and sheets.visible_sheets(hid) == ["Data"])
+stripped = sheets.strip_formatting(drawn)
+zs, zd = _zf.ZipFile(io.BytesIO(stripped)), _zf.ZipFile(io.BytesIO(drawn))
+styles = _ET.fromstring(zs.read("xl/styles.xml")); ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+fills_after = [f.find("m:patternFill", ns).get("patternType") for f in styles.find("m:fills", ns)]
+check("V.3 stripping leaves every fill 'none' and the cells, the chart and the drawing parts byte-identical",
+      set(fills_after) == {"none"} and all(zs.read(n) == zd.read(n) for n in zd.namelist()
+          if n.startswith(("xl/charts/", "xl/drawings/", "xl/media/")))
+      and zs.read("xl/worksheets/sheet1.xml").split(b"<sheetData>")[1] == zd.read("xl/worksheets/sheet1.xml").split(b"<sheetData>")[1], str(fills_after))
+tabs, tmeta = tabular.tabular_to_chunks(_xlsx(rows=400), "xlsx")
+data_chunks = [t for t in tabs if t["meta"].get("sheet") == "Data"]
+covered = [r for t in data_chunks for r in range(t["meta"]["rows"][0], t["meta"]["rows"][1] + 1)]
+check("V.4 cell chunks carry sheet and row range, ranges are contiguous and cover every row",
+      len(data_chunks) > 1 and covered == list(range(1, 401)) and all(t["meta"]["sheet"] == "Notes" for t in tabs if t not in data_chunks), str([t["meta"] for t in tabs]))
+
+
+def _pdf_with(draw):
+    d = pymupdf.open(); pg = d.new_page(); pg.insert_text((72, 72), "cells cells cells", fontsize=11); draw(pg); return d.tobytes()
+
+
+regions = pdf_engine.drawn_regions(_pdf_with(lambda pg: None))
+check("V.5 a page with text only has no drawn region", regions == [[]], str(regions))
+regions = pdf_engine.drawn_regions(_pdf_with(lambda pg: (pg.draw_rect(pymupdf.Rect(100, 100, 300, 250), fill=(0, 0, 1)), pg.draw_rect(pymupdf.Rect(100, 500, 300, 650), fill=(1, 0, 0)))))
+check("V.6 two drawings far apart are two regions, top of the page first, each rendered within the page box",
+      len(regions[0]) == 2 and regions[0][0][1][1] > regions[0][1][1][1]
+      and all(Image.open(io.BytesIO(png)).size[0] <= 1240 and Image.open(io.BytesIO(png)).size[1] <= 1754 for png, _ in regions[0]), str([b for _, b in regions[0]]))
+regions = pdf_engine.drawn_regions(_pdf_with(lambda pg: [pg.draw_rect(pymupdf.Rect(100 + 12 * i, 300, 108 + 12 * i, 300 + 10 * i), fill=(0, 0.5, 0)) for i in range(1, 12)]))
+check("V.7 bars a few points apart are one drawing", len(regions[0]) == 1, str([b for _, b in regions[0]]))
+regions = pdf_engine.drawn_regions(_pdf_with(lambda pg: pg.draw_rect(pymupdf.Rect(100, 100, 120, 110), fill=(0, 0, 0))))
+im = Image.open(io.BytesIO(regions[0][0][0]))
+check("V.8 a tiny drawing is rendered large: a 20 x 10 pt box fills the render width", im.size[0] >= 1200, str(im.size))
+
 failed = [n for n, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; FAILED: {failed}" if failed else ""))
 sys.exit(1 if failed else 0)

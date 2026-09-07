@@ -17,9 +17,11 @@ CHUNK_CHAR_BUDGET = 3500
 MIN_ROWS, MIN_COLS = 5, 2   # below this, "csv" is more likely prose with commas
 
 
-def tabular_to_chunks(data: bytes, extension: str | None = None) -> tuple[list[str], dict]:
+def tabular_to_chunks(data: bytes, extension: str | None = None) -> tuple[list[dict], dict]:
+    """[{markdown, meta}] and the file meta. Each chunk's meta says which sheet it comes from
+    (when the format has sheets) and which rows, as RowIDs, so a reader can place it."""
     sheets, meta = _read(data, extension)
-    chunks: list[str] = []
+    chunks: list[dict] = []
     total_rows = 0
     for name, df in sheets.items():
         df = _flatten(df)
@@ -35,16 +37,24 @@ def tabular_to_chunks(data: bytes, extension: str | None = None) -> tuple[list[s
         header = "| " + " | ".join(df.columns) + " |\n|" + "---|" * len(df.columns) + "\n"
         rows = ["| " + " | ".join("" if v is None else str(v) for v in row) + " |"
                 for row in df.iter_rows()]
+
+        def emit(batch: list[str], first: int, last: int):
+            cmeta = {"status": "ok", "rows": [first, last]}
+            if name:
+                cmeta["sheet"] = name
+            chunks.append({"markdown": heading + header + "\n".join(batch), "meta": cmeta})
+
         batch: list[str] = []
         size = len(heading) + len(header)
-        for row in rows:
+        first = 1
+        for i, row in enumerate(rows, start=1):
             if batch and size + len(row) > CHUNK_CHAR_BUDGET:
-                chunks.append(heading + header + "\n".join(batch))
-                batch, size = [], len(heading) + len(header)
+                emit(batch, first, i - 1)
+                batch, size, first = [], len(heading) + len(header), i
             batch.append(row)
             size += len(row) + 1
         if batch:
-            chunks.append(heading + header + "\n".join(batch))
+            emit(batch, first, len(rows))
     meta |= {"num_rows": total_rows, "num_sheets": len(sheets)}
     return chunks, meta
 

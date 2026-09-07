@@ -460,6 +460,78 @@ def _visual_share(page) -> float:
     return share
 
 
+RENDER_HEIGHT = 1754         # a region is scaled to fit this box (the size of an A4 page render)
+_REGION_GAP = 6.0            # points; drawn objects closer than this are one drawing (a chart is
+                             # hundreds of bars, lines and ticks a few points apart)
+
+
+def _cluster(boxes: list[tuple[float, float, float, float]]) -> list[list[float]]:
+    """Boxes that overlap or lie within _REGION_GAP of each other merge, until nothing merges;
+    top of the page first."""
+    pending = [list(b) for b in boxes]
+    merged = True
+    while merged:
+        merged = False
+        out: list[list[float]] = []
+        while pending:
+            a = pending.pop()
+            i = 0
+            while i < len(out):
+                b = out[i]
+                if (a[0] <= b[2] + _REGION_GAP and b[0] <= a[2] + _REGION_GAP
+                        and a[1] <= b[3] + _REGION_GAP and b[1] <= a[3] + _REGION_GAP):
+                    a = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+                    out.pop(i)
+                    merged = True
+                else:
+                    i += 1
+            out.append(a)
+        pending = out
+    return sorted(pending, key=lambda b: (-b[3], b[0]))
+
+
+def drawn_regions(pdf: bytes) -> list[list[tuple[bytes, list[float]]]]:
+    """Per page, every drawing rendered alone: (png, [left, bottom, right, top] in points).
+    A drawing is a cluster of drawn objects - images, vector graphics, forms, annotations -
+    and text is not one; a chart's labels come along because they sit inside its box. The
+    render is cut to the region with a small margin and scaled to fit RENDER_WIDTH x
+    RENDER_HEIGHT, so a chart shrunk onto a giant single-sheet page is rendered as large as
+    a chart on a small one. Nothing is filtered by size: a stray line is a region too, and
+    the VLM's verdict on it is the verdict."""
+    margin = 4.0
+    pages: list[list[tuple[bytes, list[float]]]] = []
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(pdf)
+        try:
+            for pno in range(len(doc)):
+                page = doc[pno]
+                try:
+                    w, h = page.get_width(), page.get_height()
+                    boxes = []
+                    for obj in page.get_objects(max_depth=1):
+                        if obj.type in _DRAWN:
+                            x0, y0, x1, y1 = obj.get_bounds()
+                            boxes.append((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+                    boxes += [b for b in _annotation_boxes(page) if b is not None]
+                    regions = []
+                    for x0, y0, x1, y1 in _cluster(boxes):
+                        x0, y0 = max(0.0, x0 - margin), max(0.0, y0 - margin)
+                        x1, y1 = min(w, x1 + margin), min(h, y1 + margin)
+                        if x1 <= x0 or y1 <= y0:
+                            continue
+                        scale = min(RENDER_WIDTH / (x1 - x0), RENDER_HEIGHT / (y1 - y0))
+                        pil = page.render(scale=scale, crop=(x0, y0, w - x1, h - y1)).to_pil()
+                        buf = io.BytesIO()
+                        pil.save(buf, "PNG")
+                        regions.append((buf.getvalue(), [round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1)]))
+                    pages.append(regions)
+                finally:
+                    page.close()
+        finally:
+            doc.close()
+    return pages
+
+
 def extract_pages(pdf: bytes, member_path: str = "",
                   members: dict[str, bytes] | None = None) -> list[dict]:
     """Deterministic half: one item per page for transcribe_pages. A page with graphics is a

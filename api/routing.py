@@ -43,7 +43,8 @@ import filetype
 import httpx
 from PIL import Image
 
-from pdf_engine import RetryLater, UnparseableError, parse_pdf, prompt_for, transcribe_pages  # noqa: F401 (re-exported)
+import sheets
+from pdf_engine import RetryLater, UnparseableError, drawn_regions, parse_pdf, prompt_for, transcribe_pages  # noqa: F401 (re-exported)
 from refs import rewrite_for_gotenberg
 from tabular import tabular_to_chunks, SPREADSHEET_EXTENSIONS
 from text_utils import linkify_urls, normalize_text, rewrite_md_refs, split_markdown
@@ -64,9 +65,13 @@ def image_item(png: bytes) -> dict:
     return {"render": png, "prompt": prompt_for("")}
 
 
-def _text_chunks(parts: list[str]) -> list[dict]:
-    """Deterministic text is always a complete, embeddable chunk."""
-    return [{"markdown": p, "render": None, "meta": {"status": "ok"}} for p in parts]
+def _text_chunks(parts: list) -> list[dict]:
+    """Deterministic text is always a complete, embeddable chunk. Parts are markdown strings,
+    or {markdown, meta} when the producer has something to say about the chunk (tabular:
+    sheet and rows)."""
+    return [{"markdown": p["markdown"], "render": None, "meta": {"status": "ok", **p["meta"]}}
+            if isinstance(p, dict) else {"markdown": p, "render": None, "meta": {"status": "ok"}}
+            for p in parts]
 
 
 def _no_gate(name: str):
@@ -88,8 +93,8 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
         return transcribe_pages([image_item(png)], cache), {"kind": "image", "content_type": ft.mime}
 
     if ft and ft.extension in SPREADSHEET_EXTENSIONS:
-        chunks, meta = tabular_to_chunks(data, ft.extension)
-        return _text_chunks(chunks), meta
+        tables, meta = tabular_to_chunks(data, ft.extension)
+        return _spreadsheet_chunks(data, tables, meta, ft, gate, cache)
 
     if ft and ft.extension in OFFICE_TEXT_EXTENSIONS:
         pdf = _gotenberg("/forms/libreoffice/convert",
@@ -112,8 +117,8 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
         return None, {"kind": "unparseable"}
 
     try:
-        chunks, meta = tabular_to_chunks(text)
-        return _text_chunks(chunks), meta
+        tables, meta = tabular_to_chunks(text)
+        return _text_chunks(tables), meta
     except Exception:
         pass
 
@@ -136,14 +141,57 @@ def parse_file(path: str, data: bytes, members: dict[str, bytes],
     return _text_chunks(split_markdown(md)), {"kind": "text", "content_type": "text/markdown"}
 
 
-def _gotenberg(route: str, files: list, gate) -> bytes:
+def _spreadsheet_chunks(data: bytes, tables: list[dict], meta: dict, ft, gate, cache) -> tuple[list[dict], dict]:
+    """A spreadsheet is its cells, exactly, plus whatever is drawn on its sheets. The cells are
+    the tabular chunks. When the workbook carries drawings, it is converted once - formatting
+    stripped, one page per sheet - and every drawing on every page becomes a chunk of its own:
+    its render, transcribed by the VLM, with the sheet and its position in meta. A sheet's
+    cell chunks come first, then its drawings top to bottom. Only .xlsx has the structure this
+    reads; other spreadsheet formats keep their cells only."""
+    graphics: dict[str, list] = {}
+    if ft.extension == "xlsx" and sheets.is_ooxml_workbook(data) and sheets.has_drawings(data):
+        pdf = _gotenberg("/forms/libreoffice/convert",
+                         [("files", ("document.xlsx", sheets.strip_formatting(data), ft.mime))], gate,
+                         fields={"singlePageSheets": "true"})
+        names = sheets.visible_sheets(data)
+        pages = drawn_regions(pdf)
+        if len(pages) != len(names):      # the page-to-sheet order is not certain: keep the drawings, drop the names
+            names = [None] * len(pages)
+        items = []
+        for name, regions in zip(names, pages):
+            for png, box in regions:
+                item = {"render": png, "prompt": prompt_for(""), "meta": {"region": box}}
+                if name is not None:
+                    item["meta"]["sheet"] = name
+                items.append(item)
+        described = transcribe_pages(items, cache) if items else []
+        for item, chunk in zip(items, described):
+            graphics.setdefault(item["meta"].get("sheet"), []).append(chunk)
+        meta["num_drawings"] = len(items)
+    chunks: list[dict] = []
+    seen: list = []
+    for t in tables:
+        name = t["meta"].get("sheet")
+        if name not in seen:
+            seen.append(name)
+    for name in list(graphics):
+        if name not in seen:
+            seen.append(name)
+    for name in seen:
+        chunks += _text_chunks([t for t in tables if t["meta"].get("sheet") == name])
+        chunks += graphics.get(name, [])
+    return chunks, meta
+
+
+def _gotenberg(route: str, files: list, gate, fields: dict | None = None) -> bytes:
     """One conversion at a time, health first. A healthy Gotenberg that then refuses the
     document (any non-2xx, timeouts included) has given its verdict on the document:
-    UnparseableError under this recipe. Unreachable or unhealthy is RetryLater."""
+    UnparseableError under this recipe. Unreachable or unhealthy is RetryLater. `fields` are
+    Gotenberg's form options for the route."""
     with gate("gotenberg"):
         _await_healthy()
         try:
-            r = httpx.post(GOTENBERG_URL + route, files=files, timeout=GOTENBERG_TIMEOUT)
+            r = httpx.post(GOTENBERG_URL + route, data=fields, files=files, timeout=GOTENBERG_TIMEOUT)
         except httpx.TransportError as e:
             raise RetryLater(f"gotenberg unreachable: {type(e).__name__}")
         if not r.is_success:

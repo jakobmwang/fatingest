@@ -189,7 +189,11 @@ whole process, `VLM_CONCURRENCY` pages in flight whatever file they belong to, a
 archive's members are parsed in parallel on the `FILE_CONCURRENCY` file slots, so a delivery
 of many small files keeps the model as busy as one large file does. Office documents convert via LibreOffice and html via Chromium into the same engine; images become (normalized PNG +
 VLM description) chunks; spreadsheets and tabular data become GFM pipe-table chunks batched
-by row with the header repeated; markdown and text split at ~4000 characters on heading,
+by row with the header repeated, each carrying its sheet and row range in meta, and a
+workbook's charts, pictures and shapes each become a chunk of their own: the workbook is
+converted once with its cell formatting stripped and one page per sheet, and every drawing
+on a sheet is rendered alone and transcribed by the VLM, with the sheet and its position in
+meta (the cells are never rendered, so a chart on a 20,000-row sheet comes out legible); markdown and text split at ~4000 characters on heading,
 paragraph, line, sentence, word boundaries. Local references (embedding and navigation, in html, markdown and the links a text layer
 carries) are rewritten to `sha256://<sha>` content addresses by one shared rule; a reference
 that resolves to nothing is left as written. A target never passes through the VLM: on that
@@ -302,5 +306,4 @@ separate test image (`tests/Dockerfile`) and never in the product image.
 - Read endpoints for fetching a chunk, a file's chunks, renders and meta by sha, and an
   item by feed and uri; search pagination and context expansion (neighbouring chunks of a
   hit); the shape of the search answer itself (how much text per hit) is still being decided.
-- Spreadsheets are read cell by cell (exact values, deterministic); charts, images and
-  drawings embedded in a spreadsheet are not seen.
+- Spreadsheet drawings are read from .xlsx only; other spreadsheet formats keep their cells.
